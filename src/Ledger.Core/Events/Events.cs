@@ -5,9 +5,10 @@ public static class EventType
     public const string Sale = "sale";
     public const string Return = "return";
     public const string Void = "void";
+    public const string GiftcardRedeem = "giftcard_redeem";
 
-    /// <summary>Types the ledger can currently ingest. Gift card and loyalty types join in their own stages.</summary>
-    public static readonly IReadOnlySet<string> Supported = new HashSet<string>(StringComparer.Ordinal) { Sale, Return, Void };
+    /// <summary>Types the ledger can currently ingest. Loyalty types join in their own stage.</summary>
+    public static readonly IReadOnlySet<string> Supported = new HashSet<string>(StringComparer.Ordinal) { Sale, Return, Void, GiftcardRedeem };
 }
 
 /// <summary>Why an event was refused. Stored with the raw event so nothing is silently dropped.</summary>
@@ -23,6 +24,7 @@ public static class RejectReason
     public const string MissingOccurredAt = "missing_occurred_at";
     public const string InvalidOccurredAt = "invalid_occurred_at";
     public const string MissingSaleId = "missing_sale_id";
+    public const string MissingCardId = "missing_card_id";
     public const string InvalidAmount = "invalid_amount";
     public const string InvalidCharacters = "invalid_characters";
     public const string UnknownStore = "unknown_store";
@@ -39,7 +41,9 @@ public sealed record IncomingEvent(
     string? Type,
     string? OccurredAt,
     string? SaleId,
-    long? AmountMinor);
+    long? AmountMinor,
+    string? CardId = null,
+    long? LeaseId = null);
 
 /// <summary>An event that passed validation. OccurredAtUtc is truncated to microseconds, the precision the database stores.</summary>
 public sealed record ValidEvent(
@@ -49,7 +53,9 @@ public sealed record ValidEvent(
     string Type,
     DateTimeOffset OccurredAtUtc,
     string? SaleId,
-    long? AmountMinor);
+    long? AmountMinor,
+    string? CardId = null,
+    long? LeaseId = null);
 
 public sealed record RejectedEvent(int Index, string? EventId, string Reason);
 

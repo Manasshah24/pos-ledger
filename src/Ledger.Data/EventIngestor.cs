@@ -133,10 +133,10 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
         if (rows.Count == 0) return inserted;
 
         await using var cmd = new NpgsqlCommand("""
-            INSERT INTO events (event_id, store_id, terminal_id, type, occurred_at, received_at, sale_id, amount_minor, business_date)
-            SELECT t.event_id, t.store_id, t.terminal_id, t.type, t.occurred_at, @received_at, t.sale_id, t.amount_minor, t.business_date
-            FROM unnest(@event_ids, @store_ids, @terminal_ids, @types, @occurred, @sale_ids, @amounts, @business_dates)
-                 WITH ORDINALITY AS t(event_id, store_id, terminal_id, type, occurred_at, sale_id, amount_minor, business_date, ord)
+            INSERT INTO events (event_id, store_id, terminal_id, type, occurred_at, received_at, sale_id, amount_minor, business_date, card_id, lease_id)
+            SELECT t.event_id, t.store_id, t.terminal_id, t.type, t.occurred_at, @received_at, t.sale_id, t.amount_minor, t.business_date, t.card_id, t.lease_id
+            FROM unnest(@event_ids, @store_ids, @terminal_ids, @types, @occurred, @sale_ids, @amounts, @business_dates, @card_ids, @lease_ids)
+                 WITH ORDINALITY AS t(event_id, store_id, terminal_id, type, occurred_at, sale_id, amount_minor, business_date, card_id, lease_id, ord)
             ORDER BY t.ord
             ON CONFLICT (event_id) DO NOTHING
             RETURNING event_id
@@ -151,6 +151,8 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
         cmd.Parameters.AddWithValue("sale_ids", rows.Select(r => r.Event.SaleId).ToArray());
         cmd.Parameters.AddWithValue("amounts", rows.Select(r => r.Event.AmountMinor).ToArray());
         cmd.Parameters.AddWithValue("business_dates", rows.Select(r => days[r.Event.EventId]).ToArray());
+        cmd.Parameters.AddWithValue("card_ids", rows.Select(r => r.Event.CardId).ToArray());
+        cmd.Parameters.AddWithValue("lease_ids", rows.Select(r => r.Event.LeaseId).ToArray());
 
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) inserted.Add(reader.GetString(0));
@@ -165,6 +167,19 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
     /// moment and each misses the other. Lock order is fixed (events, then sale locks, then totals rows) so it cannot deadlock.
     /// </summary>
     private async Task ProjectAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx, Dictionary<string, StoreRow> stores,
+        List<(ValidEvent Event, DateOnly Day)> added, CancellationToken ct)
+    {
+        if (added.Count == 0) return;
+
+        // Gift card redemptions are a tender, not revenue: they never touch the store-day totals.
+        var gift = added.Where(a => a.Event.Type == EventType.GiftcardRedeem).Select(a => a.Event).ToList();
+        var trade = added.Where(a => a.Event.Type != EventType.GiftcardRedeem).ToList();
+        await ProjectTradeAsync(conn, tx, stores, trade, ct);
+        await ApplyGiftCardsAsync(conn, tx, gift, ct);
+    }
+
+    private async Task ProjectTradeAsync(
         NpgsqlConnection conn, NpgsqlTransaction tx, Dictionary<string, StoreRow> stores,
         List<(ValidEvent Event, DateOnly Day)> added, CancellationToken ct)
     {
@@ -188,6 +203,109 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
 
         await ApplyEffectsAsync(conn, tx, stores, effects, ct);
         await InsertParkedAsync(conn, tx, parked, ct);
+    }
+
+    /// <summary>
+    /// Books offline gift card redemptions in log order. The card rows (and the leases they cite) are locked in a fixed order,
+    /// the balance is reduced, and every way the redemption broke the rules is recorded as a flag:
+    ///   overspend      - it pushed the card's balance below zero (the part below zero is the amount);
+    ///   no_lease       - no valid lease of this store for this card was cited;
+    ///   exceeds_lease  - the store has now redeemed more than its lease allowed;
+    ///   expired_lease  - the redemption happened after the lease expired.
+    /// An unknown card is registered with a zero balance rather than dropped: the sale really happened.
+    /// </summary>
+    private async Task ApplyGiftCardsAsync(NpgsqlConnection conn, NpgsqlTransaction tx, List<ValidEvent> gift, CancellationToken ct)
+    {
+        if (gift.Count == 0) return;
+
+        var cards = gift.Select(g => g.CardId!).Distinct().Order(StringComparer.Ordinal).ToArray();
+        await using (var create = new NpgsqlCommand(
+            "INSERT INTO giftcards (card_id, issued_minor, balance_minor, created_at) SELECT c, 0, 0, @now FROM unnest(@cards) AS c ORDER BY c ON CONFLICT DO NOTHING", conn, tx))
+        {
+            create.Parameters.AddWithValue("now", clock.UtcNow.UtcDateTime);
+            create.Parameters.AddWithValue("cards", cards);
+            await create.ExecuteNonQueryAsync(ct);
+        }
+
+        var balances = new Dictionary<string, long>(StringComparer.Ordinal);
+        await using (var cmd = new NpgsqlCommand("SELECT card_id, balance_minor FROM giftcards WHERE card_id = ANY(@cards) ORDER BY card_id FOR UPDATE", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("cards", cards);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) balances[reader.GetString(0)] = reader.GetInt64(1);
+        }
+
+        var leases = new Dictionary<long, GiftLease>();
+        var leaseIds = gift.Where(g => g.LeaseId is not null).Select(g => g.LeaseId!.Value).Distinct().Order().ToArray();
+        if (leaseIds.Length > 0)
+        {
+            await using var cmd = new NpgsqlCommand(
+                "SELECT lease_id, card_id, store_id, secured_minor + unsecured_minor, spent_minor, expires_at FROM giftcard_leases WHERE lease_id = ANY(@ids) ORDER BY lease_id FOR UPDATE", conn, tx);
+            cmd.Parameters.AddWithValue("ids", leaseIds);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                leases[reader.GetInt64(0)] = new GiftLease(reader.GetString(1), reader.GetString(2), reader.GetInt64(3), reader.GetInt64(4),
+                    new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(5), DateTimeKind.Utc)));
+        }
+
+        var flags = new List<(string EventId, string Kind, string CardId, long Amount)>();
+        foreach (var e in gift)
+        {
+            var amount = e.AmountMinor!.Value;
+
+            if (e.LeaseId is { } id && leases.TryGetValue(id, out var lease) && lease.CardId == e.CardId && lease.StoreId == e.StoreId)
+            {
+                var spentAfter = lease.Spent + amount;
+                var excess = Math.Max(0, spentAfter - lease.Allowed) - Math.Max(0, lease.Spent - lease.Allowed);
+                if (excess > 0) flags.Add((e.EventId, "exceeds_lease", e.CardId!, excess));
+                if (e.OccurredAtUtc >= lease.ExpiresAt) flags.Add((e.EventId, "expired_lease", e.CardId!, amount));
+                lease.Spent = spentAfter;
+            }
+            else flags.Add((e.EventId, "no_lease", e.CardId!, amount));
+
+            var before = balances[e.CardId!];
+            var after = before - amount;
+            var newDeficit = Math.Max(0, -after) - Math.Max(0, -before);
+            if (newDeficit > 0) flags.Add((e.EventId, "overspend", e.CardId!, newDeficit));
+            balances[e.CardId!] = after;
+        }
+
+        await using (var cmd = new NpgsqlCommand(
+            "UPDATE giftcards g SET balance_minor = t.b FROM unnest(@cards, @bals) AS t(c, b) WHERE g.card_id = t.c", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("cards", balances.Keys.ToArray());
+            cmd.Parameters.AddWithValue("bals", balances.Values.ToArray());
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        if (leases.Count > 0)
+        {
+            await using var cmd = new NpgsqlCommand(
+                "UPDATE giftcard_leases l SET spent_minor = t.s FROM unnest(@ids, @spent) AS t(i, s) WHERE l.lease_id = t.i", conn, tx);
+            cmd.Parameters.AddWithValue("ids", leases.Keys.ToArray());
+            cmd.Parameters.AddWithValue("spent", leases.Values.Select(l => l.Spent).ToArray());
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        if (flags.Count > 0)
+        {
+            await using var cmd = new NpgsqlCommand(
+                "INSERT INTO giftcard_flags (event_id, kind, card_id, amount_minor) SELECT e, k, c, a FROM unnest(@events, @kinds, @cards, @amounts) AS t(e, k, c, a)", conn, tx);
+            cmd.Parameters.AddWithValue("events", flags.Select(f => f.EventId).ToArray());
+            cmd.Parameters.AddWithValue("kinds", flags.Select(f => f.Kind).ToArray());
+            cmd.Parameters.AddWithValue("cards", flags.Select(f => f.CardId).ToArray());
+            cmd.Parameters.AddWithValue("amounts", flags.Select(f => f.Amount).ToArray());
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+    }
+
+    private sealed class GiftLease(string cardId, string storeId, long allowed, long spent, DateTimeOffset expiresAt)
+    {
+        public string CardId { get; } = cardId;
+        public string StoreId { get; } = storeId;
+        public long Allowed { get; } = allowed;
+        public long Spent { get; set; } = spent;
+        public DateTimeOffset ExpiresAt { get; } = expiresAt;
     }
 
     private static async Task LockSalesAsync(NpgsqlConnection conn, NpgsqlTransaction tx, List<(string Store, string Sale)> sales, CancellationToken ct)
@@ -332,7 +450,7 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
         var stored = new Dictionary<string, ValidEvent>(StringComparer.Ordinal);
 
         await using var cmd = new NpgsqlCommand(
-            "SELECT event_id, store_id, terminal_id, type, occurred_at, sale_id, amount_minor FROM events WHERE event_id = ANY(@ids)", conn, tx);
+            "SELECT event_id, store_id, terminal_id, type, occurred_at, sale_id, amount_minor, card_id, lease_id FROM events WHERE event_id = ANY(@ids)", conn, tx);
         cmd.Parameters.AddWithValue("ids", ids);
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -345,7 +463,9 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
                 reader.GetString(3),
                 new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(4), DateTimeKind.Utc)),
                 reader.IsDBNull(5) ? null : reader.GetString(5),
-                reader.IsDBNull(6) ? null : reader.GetInt64(6));
+                reader.IsDBNull(6) ? null : reader.GetInt64(6),
+                reader.IsDBNull(7) ? null : reader.GetString(7),
+                reader.IsDBNull(8) ? null : reader.GetInt64(8));
         }
 
         return stored;

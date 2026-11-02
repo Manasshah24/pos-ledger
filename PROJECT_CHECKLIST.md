@@ -342,10 +342,19 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
   - DoD-5's "SHA-256 over the totals table" is hashed in **our** canonical format; the panel's table format is still open (Q7/Q2). `Oracle.Hash` remains the cross-check for per-day corrected totals.
 
 ### Stage 6 — Gift card escrow & overspend bound *(L2, HC-2, FR-7/8, DoD-4)*
-- [ ] Schema: `giftcard_accounts`, `giftcard_leases`, `giftcard_redemptions`, flags
-- [ ] Online exact redeem (conditional update); lease grant/expire/return; unsecured offline limit config
-- [ ] Ingest-time reconcile; **overspend flagging**; reports
-- **Gate:** online: 1000 concurrent redeems on one card never go negative · 40 cards × 2–5 stores concurrent offline → overspend ≤ limit, all flagged (**DoD-4**) · property test: for random interleavings, bound holds · limit=0 and limit>0 variants · lease expiry returns funds
+- [x] Schema: `giftcards` (central balance, may go negative), `giftcard_leases` (secured + unsecured, spent), `giftcard_flags`; events carry `card_id` / `lease_id`
+- [x] **Online redeem is exact:** `POST /giftcards/{id}/redeem` approves only money not reserved by a lease, under a card row lock, idempotent on `eventId` (same id + different money = conflict, nothing deducted twice)
+- [x] **The scheme (mix of store-level escrow and a per-card limit):** a store takes a *lease* before going offline = secured part carved out of the balance + unsecured part carved out of the card's overspend allowance `L` (`OfflineUnsecuredLimitMinor`, default 0 = strict). Invariants kept under concurrency: `Σ secured outstanding ≤ balance` and `deficit + Σ unsecured outstanding ≤ L`. Terminals redeem offline only up to their lease, so final balance ≥ −L.
+- [x] **Reservation outlives the lease:** money stays reserved until lease expiry **+ the 48h maximum upload delay** (a store can report spending that late); releasing it earlier could let it be spent twice. Friction trade-off: leased money is frozen up to ttl+48h unless spent/reported.
+- [x] Offline redemptions (`giftcard_redeem` via `/events/batch`) are applied in log order at ingest; every rule break is a flag: `overspend` (part below zero), `no_lease`, `exceeds_lease`, `expired_lease`. Unknown cards are auto-registered at zero (the sale happened) and flagged, never dropped.
+- [x] `PUT/GET /giftcards/{id}`, `POST /giftcards/{id}/leases`, `GET /giftcards/flags`
+- **Gate:** 1000-style concurrent online redeems never go negative · 40 cards × 2–5 stores concurrent offline → overspend ≤ limit, all flagged (**DoD-4**) · limit=0 and limit>0 · lease expiry returns funds
+- **Result: PASSED** — 31 core + 10 harness + 42 integration (6 new). Key tests: 100 online attempts (16 at a time) on 5,000 → exactly 50 approved, balance exactly 0, retry/reuse handled; 20 concurrent lease requests reserve exactly the balance (5,000) and exactly the limit (2,000), never more; single-card walk-through with leases, an unleased store, an over-spender and an expired-lease spender (every cent of overspend flagged, with its cause); **40 cards, 2–5 stores each, competing for leases, duplicated + shuffled uploads through 2 replicas: compliant cards ≤ limit, balance == log, flagged overspend == actual deficit, rogue terminals caught**; gift events don't disturb the totals rebuild; HTTP walk-through
+- **Decisions / limits to defend**
+  - The bound holds for terminals that obey their lease. A terminal that doesn't can overspend, but is visible (`exceeds_lease` / `no_lease`) and the cards it touched are the only ones allowed past the limit. This is stated as the trust model.
+  - A card with no lease cannot be redeemed offline by a compliant terminal (maximum safety, maximum friction). Raising `L` trades fraud exposure for fewer declines.
+  - Not done: releasing a lease early when the store reports back, top-ups, and rebuilding gift card state from the log (balance is verified equal to *issued − Σ redemptions in the log* in the 40-card test, but it is not part of the Stage 5 rebuild/hash yet).
+  - Tests cap concurrency at 16 because opening a fresh connection to this local Postgres is slow; they test the logic, not connection storms.
 
 ### Stage 7 — Loyalty convergence *(L3, HC-3, FR-9)*
 - [ ] Per-account earn/burn as PN-counter / event-set; negative policy + flag
@@ -419,6 +428,7 @@ The PDF mentions the harness only in a few places; there is **no harness on this
 | 2026-11-02 | Stage 3 | PASSED (25 core + 10 harness + 25 integration) | Parking + release in the ingest transaction; sale-lock race test across 2 replicas |
 | 2026-11-02 | Stage 4 | PASSED (27 core + 10 harness + 33 integration) | Per-store advisory lock; adjustments linked to original day; DB guard on closed days |
 | 2026-11-03 | Stage 5 | PASSED (30 core + 10 harness + 36 integration) | Pure replay == live incremental on all read models; wipe+rebuild identical; sale identity scoped per store |
+| 2026-11-03 | Stage 6 | PASSED (31 core + 10 harness + 42 integration) | Leases (secured+unsecured), reservation = expiry+48h, overspend flags; 40-card concurrent scenario within limit |
 
 ## PART G — Decisions awaiting your input
 

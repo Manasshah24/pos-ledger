@@ -37,7 +37,7 @@ public sealed class Rebuilder(NpgsqlDataSource db)
 
         var events = new List<LogEvent>();
         await using (var cmd = new NpgsqlCommand(
-            "SELECT log_seq, event_id, store_id, type, business_date, sale_id, amount_minor FROM events ORDER BY log_seq", conn, tx))
+            "SELECT log_seq, event_id, store_id, type, business_date, sale_id, amount_minor FROM events WHERE type IN ('sale', 'return', 'void') ORDER BY log_seq", conn, tx))
         await using (var reader = await cmd.ExecuteReaderAsync(ct))
             while (await reader.ReadAsync(ct))
                 events.Add(new LogEvent(reader.GetInt64(0), reader.GetString(1), reader.GetString(2), reader.GetString(3),

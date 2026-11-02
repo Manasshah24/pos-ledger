@@ -23,6 +23,17 @@ public class EventValidatorTests
     }
 
     [Fact]
+    public void A_gift_card_redemption_needs_a_card_not_a_sale()
+    {
+        var redeem = new IncomingEvent("e1", "S1", "T1", EventType.GiftcardRedeem, "2026-01-05T10:00:00Z", null, 500, "card-1", 7);
+
+        Assert.True(EventValidator.TryValidate(redeem, out var valid, out _));
+        Assert.Equal(("card-1", 7L), (valid.CardId, valid.LeaseId));
+        Assert.Equal(RejectReason.MissingCardId, Reason(redeem with { CardId = " " }));
+        Assert.Equal(RejectReason.InvalidAmount, Reason(redeem with { AmountMinor = 0 }));
+    }
+
+    [Fact]
     public void Timestamps_become_utc_microseconds()
     {
         EventValidator.TryValidate(Good() with { OccurredAt = "2026-01-05T15:30:00.1234567+05:30" }, out var valid, out _);
