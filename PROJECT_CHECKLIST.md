@@ -328,9 +328,18 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 - **Note for Stage 5:** rebuild must write totals into shadow tables (the guard trigger would block rewriting closed days in place).
 
 ### Stage 5 — Deterministic rebuild & hash *(L2, HC-4, DoD-5)*
-- [ ] Pure replay engine over `log_seq` order shared by live path & rebuild (single code path!)
-- [ ] `POST /admin/rebuild` (shadow tables + swap or truncate-and-replay); canonical SHA-256
-- **Gate:** rebuild ×10 → identical hash · live-projection hash == rebuilt hash on 100k harness · includes adjustments & parked/resolved · property test over random event sets
+- [x] Pure replay engine `Projector.Replay(events in log_seq order, recorded closes)`: no clock, randomness or database; encodes park / release / close-then-adjust
+- [x] `POST /admin/rebuild` (replaces totals, adjustments and open parked rows from the log in one transaction; returns before/after hashes + `identical`) and `GET /admin/hash`
+- [x] Canonical SHA-256 per read model (totals incl. adjustment columns, adjustments, still-parked) + an overall hash; same functions fingerprint DB tables and an in-memory projection
+- **Gate:** rebuild ×N → identical hash · live hash == rebuilt hash on a harness stream with orphans, dups, outages and a mid-run close · includes adjustments & parked/resolved · property test over random event sets
+- **Result: PASSED** — 30 core + 10 harness + 36 integration. Key tests: live tables (built incrementally by ingest) vs the pure replay of the log agree on all three hashes; 3 rebuilds identical and `/totals` byte-for-byte unchanged; **TRUNCATE all read models → rebuild → same fingerprint and same API answers**; 2 replicas ingesting while rebuilds run → every rebuild identical, no events lost, final state == replay
+- **Decisions / deviations (to defend)**
+  - **Not literally one code path.** The checklist said live and rebuild would share code. Live ingest is incremental SQL (cheap per batch); making it share the replay would mean loading state per event. Instead the two are separate implementations and the tests require them to agree, which is stronger evidence than one piece of code agreeing with itself.
+  - **Sale identity is now `(store_id, sale_id)`.** Receipt numbers repeat across stores, and it makes each store's log an independent world, so replay and locking are per store. A return at a different store than its sale is out of scope. (Locks, known-sale lookup and parked release all changed; Stage 3/4 tests still pass.)
+  - Rebuild holds every store's advisory lock exclusively, so ingest and close queue for the (short) duration; reads are not blocked. A session flag `ledger.rebuild` lets the closed-day guard trigger allow the rewrite, only inside the rebuild transaction.
+  - Rebuild keeps only *still-open* parked rows (who was released when is history, not state) and stamps rebuilt adjustments with their event's receive time, so hashes cover state only, never wall-clock bookkeeping.
+  - The whole log is read into memory to replay: fine for 100k, not for 10M. That is exactly what Stage 8 (snapshots) is for.
+  - DoD-5's "SHA-256 over the totals table" is hashed in **our** canonical format; the panel's table format is still open (Q7/Q2). `Oracle.Hash` remains the cross-check for per-day corrected totals.
 
 ### Stage 6 — Gift card escrow & overspend bound *(L2, HC-2, FR-7/8, DoD-4)*
 - [ ] Schema: `giftcard_accounts`, `giftcard_leases`, `giftcard_redemptions`, flags
@@ -409,6 +418,7 @@ The PDF mentions the harness only in a few places; there is **no harness on this
 | 2026-11-02 | Stage 2 | PASSED (25 core + 10 harness + 21 integration) | Totals projected in the ingest transaction; atomic visibility verified through 2 replicas |
 | 2026-11-02 | Stage 3 | PASSED (25 core + 10 harness + 25 integration) | Parking + release in the ingest transaction; sale-lock race test across 2 replicas |
 | 2026-11-02 | Stage 4 | PASSED (27 core + 10 harness + 33 integration) | Per-store advisory lock; adjustments linked to original day; DB guard on closed days |
+| 2026-11-03 | Stage 5 | PASSED (30 core + 10 harness + 36 integration) | Pure replay == live incremental on all read models; wipe+rebuild identical; sale identity scoped per store |
 
 ## PART G — Decisions awaiting your input
 

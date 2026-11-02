@@ -161,7 +161,7 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
     /// Decides what each newly appended event does to the totals. A sale always applies. A return or void applies only if
     /// its sale is already in the log; otherwise it is parked. A new sale also releases anything parked for it.
     ///
-    /// Per-sale advisory locks close the race where a return and its sale commit in different transactions at the same
+    /// Per-sale (store, sale) advisory locks close the race where a return and its sale commit in different transactions at the same
     /// moment and each misses the other. Lock order is fixed (events, then sale locks, then totals rows) so it cannot deadlock.
     /// </summary>
     private async Task ProjectAsync(
@@ -170,59 +170,67 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
     {
         if (added.Count == 0) return;
 
-        await LockSalesAsync(conn, tx, added.Select(a => a.Event.SaleId!).Distinct().ToArray(), ct);
+        await LockSalesAsync(conn, tx, added.Select(a => (a.Event.StoreId, a.Event.SaleId!)).Distinct().ToList(), ct);
 
-        var dependentSales = added.Where(a => a.Event.Type != EventType.Sale).Select(a => a.Event.SaleId!).Distinct().ToArray();
-        var known = dependentSales.Length == 0 ? [] : await KnownSalesAsync(conn, tx, dependentSales, ct);
+        var dependentSales = added.Where(a => a.Event.Type != EventType.Sale).Select(a => (a.Event.StoreId, a.Event.SaleId!)).Distinct().ToList();
+        var known = dependentSales.Count == 0 ? [] : await KnownSalesAsync(conn, tx, dependentSales, ct);
 
         var effects = new List<Effect>();
         var parked = new List<ValidEvent>();
         foreach (var (e, day) in added)
         {
-            if (e.Type == EventType.Sale || known.Contains(e.SaleId!)) effects.Add(new Effect(e.EventId, e.StoreId, day, DayDelta.For(e)));
+            if (e.Type == EventType.Sale || known.Contains((e.StoreId, e.SaleId!))) effects.Add(new Effect(e.EventId, e.StoreId, day, DayDelta.For(e)));
             else parked.Add(e);
         }
 
-        var newSales = added.Where(a => a.Event.Type == EventType.Sale).Select(a => a.Event.SaleId!).Distinct().ToArray();
-        if (newSales.Length > 0) effects.AddRange(await ReleaseParkedAsync(conn, tx, newSales, ct));
+        var newSales = added.Where(a => a.Event.Type == EventType.Sale).Select(a => (a.Event.StoreId, a.Event.SaleId!)).Distinct().ToList();
+        if (newSales.Count > 0) effects.AddRange(await ReleaseParkedAsync(conn, tx, newSales, ct));
 
         await ApplyEffectsAsync(conn, tx, stores, effects, ct);
         await InsertParkedAsync(conn, tx, parked, ct);
     }
 
-    private static async Task LockSalesAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string[] saleIds, CancellationToken ct)
+    private static async Task LockSalesAsync(NpgsqlConnection conn, NpgsqlTransaction tx, List<(string Store, string Sale)> sales, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand("""
             SELECT pg_advisory_xact_lock(k)
-            FROM (SELECT DISTINCT hashtextextended(s, 0) AS k FROM unnest(@sales) AS s) AS keys
+            FROM (SELECT DISTINCT hashtextextended('sale:' || t.st || chr(31) || t.sa, 0) AS k FROM unnest(@stores, @sales) AS t(st, sa)) AS keys
             ORDER BY k
             """, conn, tx);
-        cmd.Parameters.AddWithValue("sales", saleIds);
+        cmd.Parameters.AddWithValue("stores", sales.Select(s => s.Store).ToArray());
+        cmd.Parameters.AddWithValue("sales", sales.Select(s => s.Sale).ToArray());
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    private static async Task<HashSet<string>> KnownSalesAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string[] saleIds, CancellationToken ct)
+    private static async Task<HashSet<(string Store, string Sale)>> KnownSalesAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx, List<(string Store, string Sale)> sales, CancellationToken ct)
     {
-        var known = new HashSet<string>(StringComparer.Ordinal);
-        await using var cmd = new NpgsqlCommand("SELECT DISTINCT sale_id FROM events WHERE type = 'sale' AND sale_id = ANY(@ids)", conn, tx);
-        cmd.Parameters.AddWithValue("ids", saleIds);
+        var known = new HashSet<(string, string)>();
+        await using var cmd = new NpgsqlCommand("""
+            SELECT DISTINCT e.store_id, e.sale_id
+            FROM events e JOIN unnest(@stores, @sales) AS t(st, sa) ON e.store_id = t.st AND e.sale_id = t.sa
+            WHERE e.type = 'sale'
+            """, conn, tx);
+        cmd.Parameters.AddWithValue("stores", sales.Select(s => s.Store).ToArray());
+        cmd.Parameters.AddWithValue("sales", sales.Select(s => s.Sale).ToArray());
         await using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct)) known.Add(reader.GetString(0));
+        while (await reader.ReadAsync(ct)) known.Add((reader.GetString(0), reader.GetString(1)));
         return known;
     }
 
     private async Task<List<Effect>> ReleaseParkedAsync(
-        NpgsqlConnection conn, NpgsqlTransaction tx, string[] saleIds, CancellationToken ct)
+        NpgsqlConnection conn, NpgsqlTransaction tx, List<(string Store, string Sale)> sales, CancellationToken ct)
     {
         var released = new List<Effect>();
         await using var cmd = new NpgsqlCommand("""
             UPDATE parked_events p SET resolved_at = @now
-            FROM events e
-            WHERE e.event_id = p.event_id AND p.resolved_at IS NULL AND p.sale_id = ANY(@sales)
+            FROM events e, unnest(@stores, @sales) AS t(st, sa)
+            WHERE e.event_id = p.event_id AND p.resolved_at IS NULL AND e.store_id = t.st AND p.sale_id = t.sa
             RETURNING e.event_id, e.store_id, e.business_date, e.type, e.amount_minor
             """, conn, tx);
         cmd.Parameters.AddWithValue("now", clock.UtcNow.UtcDateTime);
-        cmd.Parameters.AddWithValue("sales", saleIds);
+        cmd.Parameters.AddWithValue("stores", sales.Select(s => s.Store).ToArray());
+        cmd.Parameters.AddWithValue("sales", sales.Select(s => s.Sale).ToArray());
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
             released.Add(new Effect(reader.GetString(0), reader.GetString(1), DateOnly.FromDateTime(reader.GetDateTime(2)),
@@ -252,11 +260,6 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
         NpgsqlConnection conn, NpgsqlTransaction tx, Dictionary<string, StoreRow> stores, List<Effect> effects, CancellationToken ct)
     {
         if (effects.Count == 0) return;
-
-        // A released orphan can belong to a store that was not in this batch.
-        var missing = effects.Select(e => e.StoreId).Where(id => !stores.ContainsKey(id)).Distinct().ToArray();
-        if (missing.Length > 0)
-            foreach (var (id, row) in await LoadStoresAsync(conn, tx, missing, ct)) stores[id] = row;
 
         var rows = new Dictionary<(string StoreId, DateOnly Day), (DayDelta Own, DayDelta Adj)>();
         var adjustments = new List<(Effect Effect, DateOnly AppliedDay)>();

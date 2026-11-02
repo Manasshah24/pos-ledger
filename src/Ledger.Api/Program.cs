@@ -17,6 +17,7 @@ builder.Services.AddSingleton<StoreRegistry>();
 builder.Services.AddSingleton<TotalsQuery>();
 builder.Services.AddSingleton<ParkedQuery>();
 builder.Services.AddSingleton<DayCloser>();
+builder.Services.AddSingleton<Rebuilder>();
 builder.Services.AddHostedService<Ledger.Api.DayCloseScheduler>();
 
 var app = builder.Build();
@@ -84,6 +85,10 @@ app.MapPost("/admin/stores/{storeId}/close", async (string storeId, string throu
 });
 
 app.MapPost("/admin/close-due", async (DayCloser closer, CancellationToken ct) => Results.Ok(await closer.CloseDueAsync(ct)));
+
+app.MapGet("/admin/hash", async (Rebuilder rebuilder, CancellationToken ct) => Results.Ok(await rebuilder.HashAsync(ct)));
+
+app.MapPost("/admin/rebuild", async (Rebuilder rebuilder, CancellationToken ct) => Results.Ok(await rebuilder.RebuildAsync(ct)));
 
 app.MapGet("/parked", async (ParkedQuery parked, CancellationToken ct) => Results.Ok(await parked.GetOpenAsync(ct)));
 

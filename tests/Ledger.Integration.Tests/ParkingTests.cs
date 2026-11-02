@@ -48,6 +48,24 @@ public class ParkingTests : IClassFixture<PostgresFixture>
     }
 
     [Fact]
+    public async Task A_sale_id_only_matches_a_sale_in_the_same_store()
+    {
+        await using var db = await _pg.NewMigratedDataSourceAsync();
+        await RegisterStoresAsync(db, new StoreInfo("S1", "UTC"), new StoreInfo("S2", "UTC"));
+        var ingestor = Ingestor(db);
+
+        // Receipt numbers repeat across stores: S2's sale "x" must not release or satisfy S1's return of its own sale "x".
+        await ingestor.IngestAsync(Raws(Sale("s2-x", "x", 111) with { StoreId = "S2" }, Return("s1-r", "x", 300)));
+
+        Assert.Equal(["s1-r"], (await new ParkedQuery(db).GetOpenAsync()).Select(p => p.EventId));
+
+        await ingestor.IngestAsync(Raws(Sale("s1-x", "x", 1000)));
+
+        Assert.Empty(await new ParkedQuery(db).GetOpenAsync());
+        Assert.Equal(700, (await new TotalsQuery(db).GetAsync("S1")).Sum(t => t.NetMinor));
+    }
+
+    [Fact]
     public async Task Sale_and_return_in_the_same_batch_apply_in_either_order_without_parking()
     {
         await using var db = await DbWithStore();
