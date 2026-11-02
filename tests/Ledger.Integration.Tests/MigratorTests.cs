@@ -15,7 +15,7 @@ public class MigratorTests : IClassFixture<PostgresFixture>
     {
         await using var db = NpgsqlDataSource.Create(await _pg.NewDatabaseAsync());
 
-        Assert.Equal(["0001_baseline.sql", "0002_events.sql", "0003_totals.sql"], await Migrator.MigrateAsync(db));
+        Assert.Equal(["0001_baseline.sql", "0002_events.sql", "0003_totals.sql", "0004_parked.sql"], await Migrator.MigrateAsync(db));
         Assert.Empty(await Migrator.MigrateAsync(db));
     }
 

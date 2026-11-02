@@ -303,9 +303,13 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 - **Decisions:** return/void are booked to the business day of their own `occurredAt` (matches oracle); totals rows are upserted in (store, day) order so concurrent batches can't deadlock. Stage 3 will change returns/voids so they are *held* until their sale is known (today they apply immediately).
 
 ### Stage 3 — Orphan returns/voids parking *(L1, FR-3)*
-- [ ] `parked_events`; park on missing sale; resolve in same txn when sale arrives
-- [ ] `GET /parked` report (age, reason)
-- **Gate:** return-before-sale, void-before-sale, duplicate-return-before-sale, sale arrives via different replica · property test: arrival order doesn't change final totals · **checkpoint:** run our 100k harness → totals match oracle (**DoD-1 for L1 scope**)
+- [x] `parked_events`; a return/void whose sale is not in the log is stored in the log but **held out of the totals**; a new sale releases everything parked for it, in the same transaction
+- [x] `GET /parked` report (event, type, store, sale, amount, parked-at), oldest first; a return whose sale never arrives stays visible
+- [x] Race-safe: per-sale advisory locks (fixed lock order: events, sale locks, totals rows) so a return and its sale committing on different replicas at the same instant can't miss each other
+- **Gate:** return-before-sale, void-before-sale, same batch any order, duplicate while parked / after release, 150 sale+return pairs racing across 2 replicas leave nothing stuck, and the 20k harness stream (with its orphan returns) still matches the oracle with `/parked` empty at the end
+- **Result: PASSED** — 25 core + 10 harness + 25 integration. Integration test classes now run one at a time (parallel classes exhausted local Postgres connection setup; concurrency *inside* each test is unchanged)
+- **Not done / deferred (not in the DoD):** flagging a return that exceeds its sale's remaining amount (Stage 2 gate text mentioned it; it was not built). Duplicate sale ids with different event ids are not rejected.
+- **Decision:** totals are independent of parking order — once every sale has arrived, the result equals the oracle; only never-resolved orphans are excluded.
 
 ### Stage 4 — Day close & adjustments *(L2, FR-5/6, DoD-3)*
 - [ ] `store_days` status; `POST /stores/{id}/days/{date}/close` + scheduled 02:00 closer (clock-driven)
@@ -393,6 +397,7 @@ The PDF mentions the harness only in a few places; there is **no harness on this
 | 2026-11-02 | Stage 0 | PASSED (34 tests) | Portable Postgres 17.2 in tools/; oracle is independent of service code |
 | 2026-11-02 | Stage 1 | PASSED (52 tests, trimmed) | 100k harness stream via 2 replicas = oracle totals at log level |
 | 2026-11-02 | Stage 2 | PASSED (25 core + 10 harness + 21 integration) | Totals projected in the ingest transaction; atomic visibility verified through 2 replicas |
+| 2026-11-02 | Stage 3 | PASSED (25 core + 10 harness + 25 integration) | Parking + release in the ingest transaction; sale-lock race test across 2 replicas |
 
 ## PART G — Decisions awaiting your input
 

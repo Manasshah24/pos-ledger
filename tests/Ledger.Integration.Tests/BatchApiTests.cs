@@ -124,5 +124,9 @@ public class BatchApiTests : IClassFixture<PostgresFixture>
             served[new StoreDay(t.StoreId, t.BusinessDate)] = t.NetMinor;
 
         Assert.Equal(Oracle.Hash(Oracle.NetTotals(data.UniqueEvents, data.Stores)), Oracle.Hash(served));
+
+        // The stream contains orphan returns that arrived before their sale; every one must have been released.
+        Assert.NotEmpty(data.OrphanReturnEventIds);
+        Assert.Empty((await clients[0].GetFromJsonAsync<List<Ledger.Data.ParkedEvent>>("/parked"))!);
     }
 }

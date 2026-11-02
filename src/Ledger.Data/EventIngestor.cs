@@ -68,7 +68,7 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
         // 4. Append. Anything not returned already existed. Only newly appended events touch the totals,
         //    and they do so in this same transaction, so readers see the log and the totals move together.
         var inserted = await InsertAsync(conn, tx, toInsert, days, ct);
-        await ApplyTotalsAsync(conn, tx, toInsert.Where(c => inserted.Contains(c.Event.EventId)).Select(c => (c.Event, days[c.Event.EventId])).ToList(), ct);
+        await ProjectAsync(conn, tx, toInsert.Where(c => inserted.Contains(c.Event.EventId)).Select(c => (c.Event, days[c.Event.EventId])).ToList(), ct);
         var existing = toInsert.Where(c => !inserted.Contains(c.Event.EventId)).ToList();
 
         // 5. Existing ids: same content is a harmless retry, different content is a conflict worth recording.
@@ -137,17 +137,100 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
     }
 
     /// <summary>
-    /// Adds the new events' effect to the store-day totals. Rows are written in (store, day) order by the database so
-    /// two concurrent batches touching the same days take their row locks in the same order and cannot deadlock.
+    /// Decides what each newly appended event does to the totals. A sale always applies. A return or void applies only if
+    /// its sale is already in the log; otherwise it is parked. A new sale also releases anything parked for it.
+    ///
+    /// Per-sale advisory locks close the race where a return and its sale commit in different transactions at the same
+    /// moment and each misses the other. Lock order is fixed (events, then sale locks, then totals rows) so it cannot deadlock.
     /// </summary>
-    private static async Task ApplyTotalsAsync(
+    private async Task ProjectAsync(
         NpgsqlConnection conn, NpgsqlTransaction tx, List<(ValidEvent Event, DateOnly Day)> added, CancellationToken ct)
     {
         if (added.Count == 0) return;
 
-        var perDay = added
-            .GroupBy(a => (a.Event.StoreId, a.Day))
-            .Select(g => (g.Key.StoreId, g.Key.Day, Delta: g.Aggregate(default(DayDelta), (sum, a) => sum + DayDelta.For(a.Event))))
+        await LockSalesAsync(conn, tx, added.Select(a => a.Event.SaleId!).Distinct().ToArray(), ct);
+
+        var dependentSales = added.Where(a => a.Event.Type != EventType.Sale).Select(a => a.Event.SaleId!).Distinct().ToArray();
+        var known = dependentSales.Length == 0 ? [] : await KnownSalesAsync(conn, tx, dependentSales, ct);
+
+        var apply = new List<(string StoreId, DateOnly Day, DayDelta Delta)>();
+        var parked = new List<ValidEvent>();
+        foreach (var (e, day) in added)
+        {
+            if (e.Type == EventType.Sale || known.Contains(e.SaleId!)) apply.Add((e.StoreId, day, DayDelta.For(e)));
+            else parked.Add(e);
+        }
+
+        var newSales = added.Where(a => a.Event.Type == EventType.Sale).Select(a => a.Event.SaleId!).Distinct().ToArray();
+        if (newSales.Length > 0) apply.AddRange(await ReleaseParkedAsync(conn, tx, newSales, ct));
+
+        await ApplyTotalsAsync(conn, tx, apply, ct);
+        await InsertParkedAsync(conn, tx, parked, ct);
+    }
+
+    private static async Task LockSalesAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string[] saleIds, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand("""
+            SELECT pg_advisory_xact_lock(k)
+            FROM (SELECT DISTINCT hashtextextended(s, 0) AS k FROM unnest(@sales) AS s) AS keys
+            ORDER BY k
+            """, conn, tx);
+        cmd.Parameters.AddWithValue("sales", saleIds);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private static async Task<HashSet<string>> KnownSalesAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string[] saleIds, CancellationToken ct)
+    {
+        var known = new HashSet<string>(StringComparer.Ordinal);
+        await using var cmd = new NpgsqlCommand("SELECT DISTINCT sale_id FROM events WHERE type = 'sale' AND sale_id = ANY(@ids)", conn, tx);
+        cmd.Parameters.AddWithValue("ids", saleIds);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct)) known.Add(reader.GetString(0));
+        return known;
+    }
+
+    private async Task<List<(string StoreId, DateOnly Day, DayDelta Delta)>> ReleaseParkedAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx, string[] saleIds, CancellationToken ct)
+    {
+        var released = new List<(string, DateOnly, DayDelta)>();
+        await using var cmd = new NpgsqlCommand("""
+            UPDATE parked_events p SET resolved_at = @now
+            FROM events e
+            WHERE e.event_id = p.event_id AND p.resolved_at IS NULL AND p.sale_id = ANY(@sales)
+            RETURNING e.store_id, e.business_date, e.type, e.amount_minor
+            """, conn, tx);
+        cmd.Parameters.AddWithValue("now", clock.UtcNow.UtcDateTime);
+        cmd.Parameters.AddWithValue("sales", saleIds);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            released.Add((reader.GetString(0), DateOnly.FromDateTime(reader.GetDateTime(1)), DayDelta.For(reader.GetString(2), reader.GetInt64(3))));
+        return released;
+    }
+
+    private async Task InsertParkedAsync(NpgsqlConnection conn, NpgsqlTransaction tx, List<ValidEvent> parked, CancellationToken ct)
+    {
+        if (parked.Count == 0) return;
+
+        await using var cmd = new NpgsqlCommand(
+            "INSERT INTO parked_events (event_id, sale_id, parked_at) SELECT e, s, @now FROM unnest(@ids, @sales) AS t(e, s)", conn, tx);
+        cmd.Parameters.AddWithValue("now", clock.UtcNow.UtcDateTime);
+        cmd.Parameters.AddWithValue("ids", parked.Select(p => p.EventId).ToArray());
+        cmd.Parameters.AddWithValue("sales", parked.Select(p => p.SaleId!).ToArray());
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// Adds effects to the store-day totals. Rows are written in (store, day) order by the database so
+    /// two concurrent batches touching the same days take their row locks in the same order and cannot deadlock.
+    /// </summary>
+    private static async Task ApplyTotalsAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx, List<(string StoreId, DateOnly Day, DayDelta Delta)> effects, CancellationToken ct)
+    {
+        if (effects.Count == 0) return;
+
+        var perDay = effects
+            .GroupBy(a => (a.StoreId, a.Day))
+            .Select(g => (g.Key.StoreId, g.Key.Day, Delta: g.Aggregate(default(DayDelta), (sum, a) => sum + a.Delta)))
             .ToList();
 
         await using var cmd = new NpgsqlCommand("""

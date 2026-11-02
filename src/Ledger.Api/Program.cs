@@ -15,6 +15,7 @@ builder.Services.AddSingleton(builder.Configuration.GetSection("Ledger").Get<Led
 builder.Services.AddSingleton<EventIngestor>();
 builder.Services.AddSingleton<StoreRegistry>();
 builder.Services.AddSingleton<TotalsQuery>();
+builder.Services.AddSingleton<ParkedQuery>();
 
 var app = builder.Build();
 
@@ -70,6 +71,8 @@ app.MapPost("/events/batch", async (HttpRequest request, EventIngestor ingestor,
 
 app.MapGet("/totals", async (string? storeId, TotalsQuery totals, CancellationToken ct) =>
     Results.Ok(await totals.GetAsync(storeId, ct)));
+
+app.MapGet("/parked", async (ParkedQuery parked, CancellationToken ct) => Results.Ok(await parked.GetOpenAsync(ct)));
 
 app.MapGet("/stores/{storeId}/days/{date}", async (string storeId, string date, TotalsQuery totals, CancellationToken ct) =>
 {
