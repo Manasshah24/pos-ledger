@@ -312,10 +312,20 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 - **Decision:** totals are independent of parking order — once every sale has arrived, the result equals the oracle; only never-resolved orphans are excluded.
 
 ### Stage 4 — Day close & adjustments *(L2, FR-5/6, DoD-3)*
-- [ ] `store_days` status; `POST /stores/{id}/days/{date}/close` + scheduled 02:00 closer (clock-driven)
-- [ ] `day_closed` marker in the log; late events → `adjustments` in next open day with link to original day
-- [ ] Guard: closed-day totals immutable (DB-level guard + test)
-- **Gate:** late event after close → adjustment, closed total byte-unchanged · race: close vs concurrent ingest on 2 replicas · cascading case (next day also closed → next *open* day) · 48h-late boundary · DoD-3 scenario test
+- [x] Close model: a store's days close in order, so "closed" is one date (`stores.last_closed_date`). `POST /admin/stores/{id}/close?through=yyyy-MM-dd` (idempotent, never reopens) and `POST /admin/close-due` (clock-driven: closes each store's days that have ended per its own time zone). A background scheduler runs close-due on every replica but is **off by default** (`Ledger:AutoCloseIntervalSeconds`, 0 = off) so a replay of old simulated timestamps against the real clock can't close everything by accident
+- [x] Close is recorded in the log order: `day_closures` stores `log_seq_mark` (highest log_seq of that store at close), so Stage 5's rebuild can replay the close in the right place
+- [x] Late events (day already closed) never touch the closed day: they become rows in `adjustments` (linked `original_date` → `applied_date` = next open day) and add to that open day's `adj_*` columns
+- [x] `GET /totals` now returns per store-day: own `netMinor` (frozen on close), `closed`, `adjustmentsInMinor` (landed here from earlier days), `correctionsMinor` (belongs here, landed later), and computed `reportedNetMinor` / `correctedNetMinor`
+- [x] DB guard: a trigger refuses any insert/update on a closed day's totals row, so even a bug in app code cannot change it
+- [x] Orphans released after a close are booked as adjustments too
+- **Gate:** late event → adjustment with the closed day byte-unchanged · cascade (several days closed → lands in the next open day) · close racing 2 replicas mid-ingest · DoD-3 style harness run
+- **Result: PASSED** — 27 core (incl. day-end-vs-business-day property over 6 zones with DST) + 10 harness + 33 integration. Harness test: 60% of a 10k stream → close every store through Jan 6 → remaining 40% (late events) → closed days identical to their close-time snapshot, adjustments exist, and corrected totals equal the oracle; money conserved (reported sum == corrected sum); `/parked` empty
+- **Decisions / findings**
+  - Race protection is a **per-store advisory lock** (ingest shared, close exclusive, held to commit). A queued exclusive lock makes later ingests wait behind it, so a close cannot be starved by a steady stream of batches. The close deliberately takes no `FOR UPDATE` row lock on `stores`.
+  - The race test first "failed" because opening a new Postgres connection took 1.6 s on this machine (longer than the whole run), not because of locking; the test now pre-warms the pool.
+  - "Which total is the harness's checksum" is still open (Q2): we expose own, reported and corrected so either reading can be matched.
+  - Ambiguous wall-clock cut-offs (fall-back hour) use the first occurrence in both `For` and `EndUtc`; verified by the property test.
+- **Note for Stage 5:** rebuild must write totals into shadow tables (the guard trigger would block rewriting closed days in place).
 
 ### Stage 5 — Deterministic rebuild & hash *(L2, HC-4, DoD-5)*
 - [ ] Pure replay engine over `log_seq` order shared by live path & rebuild (single code path!)
@@ -398,6 +408,7 @@ The PDF mentions the harness only in a few places; there is **no harness on this
 | 2026-11-02 | Stage 1 | PASSED (52 tests, trimmed) | 100k harness stream via 2 replicas = oracle totals at log level |
 | 2026-11-02 | Stage 2 | PASSED (25 core + 10 harness + 21 integration) | Totals projected in the ingest transaction; atomic visibility verified through 2 replicas |
 | 2026-11-02 | Stage 3 | PASSED (25 core + 10 harness + 25 integration) | Parking + release in the ingest transaction; sale-lock race test across 2 replicas |
+| 2026-11-02 | Stage 4 | PASSED (27 core + 10 harness + 33 integration) | Per-store advisory lock; adjustments linked to original day; DB guard on closed days |
 
 ## PART G — Decisions awaiting your input
 

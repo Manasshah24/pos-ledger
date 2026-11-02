@@ -44,4 +44,28 @@ public class BusinessDayTests
 
         Prop.ForAll(gen.ToArbitrary(), t => Day(t.zone, t.A) <= Day(t.zone, t.B)).QuickCheckThrowOnFailure();
     }
+
+    [Fact]
+    public void Day_end_is_the_first_instant_of_the_next_business_day()
+    {
+        var ny = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+
+        Assert.Equal(Utc(2026, 1, 6, 2), BusinessDay.EndUtc(new DateOnly(2026, 1, 5), TimeZoneInfo.Utc, 2));
+        Assert.Equal(Utc(2026, 3, 8, 7), BusinessDay.EndUtc(new DateOnly(2026, 3, 7), ny, 2)); // spring forward: 03:00 EDT
+        Assert.Equal(Utc(2026, 11, 1, 7), BusinessDay.EndUtc(new DateOnly(2026, 10, 31), ny, 2)); // fall back: 02:00 EST
+    }
+
+    [Fact]
+    public void Property_an_instant_is_in_a_business_day_exactly_when_it_is_before_that_days_end()
+    {
+        string[] zones = ["UTC", "Asia/Kolkata", "America/New_York", "Europe/London", "Australia/Sydney", "Pacific/Auckland"];
+        var gen = from zone in Gen.Elements(zones) from m in Gen.Choose(0, 5_000_000) select (zone, T: Utc(2020, 1, 1, 0).AddMinutes(m));
+
+        Prop.ForAll(gen.ToArbitrary(), x =>
+        {
+            var tz = TimeZoneInfo.FindSystemTimeZoneById(x.zone);
+            var day = BusinessDay.For(x.T, tz, 2);
+            return x.T < BusinessDay.EndUtc(day, tz, 2) && x.T >= BusinessDay.EndUtc(day.AddDays(-1), tz, 2);
+        }).QuickCheckThrowOnFailure();
+    }
 }

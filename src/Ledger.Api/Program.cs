@@ -16,6 +16,8 @@ builder.Services.AddSingleton<EventIngestor>();
 builder.Services.AddSingleton<StoreRegistry>();
 builder.Services.AddSingleton<TotalsQuery>();
 builder.Services.AddSingleton<ParkedQuery>();
+builder.Services.AddSingleton<DayCloser>();
+builder.Services.AddHostedService<Ledger.Api.DayCloseScheduler>();
 
 var app = builder.Build();
 
@@ -71,6 +73,17 @@ app.MapPost("/events/batch", async (HttpRequest request, EventIngestor ingestor,
 
 app.MapGet("/totals", async (string? storeId, TotalsQuery totals, CancellationToken ct) =>
     Results.Ok(await totals.GetAsync(storeId, ct)));
+
+app.MapPost("/admin/stores/{storeId}/close", async (string storeId, string through, DayCloser closer, CancellationToken ct) =>
+{
+    if (!DateOnly.TryParseExact(through, "yyyy-MM-dd", out var day))
+        return Results.BadRequest(new { error = "invalid_date" });
+
+    var result = await closer.CloseThroughAsync(storeId, day, ct);
+    return result is null ? Results.NotFound() : Results.Ok(result);
+});
+
+app.MapPost("/admin/close-due", async (DayCloser closer, CancellationToken ct) => Results.Ok(await closer.CloseDueAsync(ct)));
 
 app.MapGet("/parked", async (ParkedQuery parked, CancellationToken ct) => Results.Ok(await parked.GetOpenAsync(ct)));
 
