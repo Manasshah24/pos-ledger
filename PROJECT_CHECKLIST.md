@@ -124,6 +124,7 @@ These shape the code; we design so the answer only touches one adapter layer.
 | Q4 | How do terminals behave offline for gift cards — does the harness implement a lease protocol or just emit redeem events? | We define the terminal rules (lease + offline limit) **and** can also detect overspend purely from ingested events (works either way) |
 | Q5 | Currency / rounding rules | Single currency per store, no rounding needed (already minor units) |
 | Q6 | Does `void` reference sale by `sale_id`? Does `return` carry `sale_id` + amount or line items? | Reference by `sale_id`; amount given in the event |
+| Q7 | How do store ids and their time zones reach us? | Stores are registered via `PUT /stores/{id}` before events; events for unknown stores are rejected (`unknown_store`), never silently bucketed in a guessed zone |
 
 ### B3. Key design decisions (draft — to be frozen into the 1–2 page design doc)
 
@@ -278,10 +279,20 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 - **Result: PASSED** — 26 unit tests (4 core, 22 harness) + 8 integration tests (5 migrator incl. 8 concurrent replicas, 3 health incl. 2 replicas) green
 
 ### Stage 1 — Event log & idempotent ingest *(L1, HC-1)*
-- [ ] Schema: `events`, `stores`, `rejected_events`; `UNIQUE(event_id)`; `log_seq`
-- [ ] `POST /events/batch` — validation, per-event reject, batch transaction
-- [ ] Duplicate handling (`ON CONFLICT DO NOTHING`), response reports inserted/duplicate/rejected counts
+- [x] Schema: `events`, `stores`, `rejected_events`; `UNIQUE(event_id)`; `log_seq` (migration `0002_events.sql`)
+- [x] `POST /events/batch` — validation, per-event reject (reason + raw payload kept), single batch transaction
+- [x] Duplicate handling (`ON CONFLICT DO NOTHING`), response reports `inserted` / `duplicates` / `rejected[{index,eventId,reason}]`
+- [x] Same id + different content = `event_id_conflict` (first version wins, conflict recorded)
+- [x] `PUT /stores/{id}` store registry (unknown store rejected; time-zone change refused with 409)
+- [x] Business-day function (02:00 cut-off, store tz, DST spring-forward/fall-back)
 - **Gate (unit):** validation, business-date function (incl. 02:00 edge, DST, tz) · **(automation):** same batch ×N → 1 effect; 2 replicas ingest same batch concurrently → 1 effect; replica killed mid-batch → no partial rows; property test: any duplication/permutation → same log set
+- **Result: PASSED** (trimmed to risk-focused tests) — 52 tests green across all projects (Core 23, harness 10, integration 19). Hard-core coverage: same batch ×5 = 1 effect; 8 concurrent senders over 2 ingestors = each event once; opposite-order overlapping batches don't deadlock; injected mid-batch crash rolls back everything and the retry lands once; seeded random split/repeat/shuffle gives an identical log; 2 HTTP replicas on the same batch insert once; and a 20k-delivery harness stream (dups, orphans, outages) through 2 replicas gives log totals hash-equal to the independent oracle
+- **Decisions made in this stage**
+  - Rows are inserted sorted by `event_id` so overlapping batches lock in the same order (deadlock-free, proven by test); `log_seq` is therefore ingest order across batches, not arrival order within a batch.
+  - Lateness (48h) is **not** enforced as a rejection: the panel's harness replays old simulated timestamps against a real clock, and the requirement is to *accept* late events.
+  - Timestamps must carry an explicit offset (`Z` or `+hh:mm`); naive times are rejected as ambiguous. Money must be a JSON integer (`"500"` and `12.5` are malformed).
+  - Real `kill -9` of a replica process is covered in Stage 9 chaos; here the same property is proven with an injected DB error mid-transaction.
+  - New open question **Q7**: how stores/time zones reach the ledger (we require `PUT /stores/{id}` first; the panel's harness may need an adapter or a seed list).
 
 ### Stage 2 — Projections: net store-day totals + atomic visibility *(L1, DoD-2)*
 - [ ] `store_day_totals` projection for sale / return / void (+ tender breakdown for giftcard)
@@ -378,6 +389,7 @@ The PDF mentions the harness only in a few places; there is **no harness on this
 | 2026-11-02 | Analysis | Part A–E written | Awaiting instructions to start Stage 0 |
 | 2026-11-02 | Stack revisit | Briefly moved to Go; reverted to C#/.NET 10 + Postgres because Go install needs admin (LA password expired) | Part H (harness) added; can start Stage 0 without admin |
 | 2026-11-02 | Stage 0 | PASSED (34 tests) | Portable Postgres 17.2 in tools/; oracle is independent of service code |
+| 2026-11-02 | Stage 1 | PASSED (52 tests, trimmed) | 100k harness stream via 2 replicas = oracle totals at log level |
 
 ## PART G — Decisions awaiting your input
 

@@ -1,5 +1,6 @@
 using Dapper;
 using Ledger.Core;
+using Ledger.Core.Events;
 using Ledger.Data;
 using Npgsql;
 
@@ -11,6 +12,8 @@ var connectionString = builder.Configuration.GetConnectionString("Ledger")
 builder.Services.AddSingleton(NpgsqlDataSource.Create(connectionString));
 builder.Services.AddSingleton<IClock, SystemClock>();
 builder.Services.AddSingleton(builder.Configuration.GetSection("Ledger").Get<LedgerOptions>() ?? new LedgerOptions());
+builder.Services.AddSingleton<EventIngestor>();
+builder.Services.AddSingleton<StoreRegistry>();
 
 var app = builder.Build();
 
@@ -31,6 +34,41 @@ app.MapGet("/health", async (NpgsqlDataSource db) =>
     }
 });
 
+app.MapPut("/stores/{storeId}", async (string storeId, StoreRequest body, StoreRegistry stores) =>
+{
+    if (string.IsNullOrWhiteSpace(storeId) || storeId.Length > EventValidator.MaxIdLength || storeId.Contains('\0'))
+        return Results.BadRequest(new { error = "invalid_store_id" });
+    if (string.IsNullOrWhiteSpace(body.Tz) || !TimeZoneInfo.TryFindSystemTimeZoneById(body.Tz, out _))
+        return Results.BadRequest(new { error = "invalid_time_zone" });
+
+    var currency = body.Currency ?? "USD";
+    if (currency.Length != 3 || !currency.All(char.IsAsciiLetterUpper))
+        return Results.BadRequest(new { error = "invalid_currency" });
+
+    return await stores.UpsertAsync(storeId, body.Tz, currency) switch
+    {
+        StoreUpsertResult.Created => Results.Created($"/stores/{storeId}", new { storeId, tz = body.Tz, currency }),
+        StoreUpsertResult.Unchanged => Results.Ok(new { storeId, tz = body.Tz, currency }),
+        _ => Results.Conflict(new { error = "time_zone_change_not_allowed" }),
+    };
+});
+
+app.MapPost("/events/batch", async (HttpRequest request, EventIngestor ingestor, CancellationToken ct) =>
+{
+    using var reader = new StreamReader(request.Body);
+    var parsed = BatchParser.Parse(await reader.ReadToEndAsync(ct));
+
+    if (parsed.Error == BatchParser.BatchTooLarge)
+        return Results.Json(new { error = parsed.Error, max = BatchParser.MaxBatchSize }, statusCode: StatusCodes.Status413PayloadTooLarge);
+    if (parsed.Events is null)
+        return Results.BadRequest(new { error = parsed.Error });
+
+    var result = await ingestor.IngestAsync(parsed.Events, ct);
+    return Results.Ok(new { inserted = result.Inserted, duplicates = result.Duplicates, rejected = result.Rejected });
+});
+
 app.Run();
+
+public sealed record StoreRequest(string? Tz, string? Currency);
 
 public partial class Program;
