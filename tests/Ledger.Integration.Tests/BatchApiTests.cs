@@ -118,16 +118,11 @@ public class BatchApiTests : IClassFixture<PostgresFixture>
         Assert.Equal(0, rejected);
         Assert.Equal(data.UniqueEvents.Count, inserted);
 
-        // The log, aggregated by SQL, equals the independent oracle for every store-day.
-        await using var db = NpgsqlDataSource.Create(cs);
-        await using var conn = await db.OpenConnectionAsync();
-        var fromLog = new SortedDictionary<StoreDay, long>();
-        foreach (var (store, day, net) in await conn.QueryAsync<(string, DateOnly, long)>("""
-            SELECT store_id, business_date, sum(CASE type WHEN 'sale' THEN amount_minor ELSE -amount_minor END)
-            FROM events GROUP BY store_id, business_date
-            """))
-            fromLog[new StoreDay(store, day)] = net;
+        // Every store-day total served by the API equals the independent oracle (the DoD-1 check, at this scale).
+        var served = new SortedDictionary<StoreDay, long>();
+        foreach (var t in (await clients[0].GetFromJsonAsync<List<Ledger.Data.StoreDayTotal>>("/totals"))!)
+            served[new StoreDay(t.StoreId, t.BusinessDate)] = t.NetMinor;
 
-        Assert.Equal(Oracle.Hash(Oracle.NetTotals(data.UniqueEvents, data.Stores)), Oracle.Hash(fromLog));
+        Assert.Equal(Oracle.Hash(Oracle.NetTotals(data.UniqueEvents, data.Stores)), Oracle.Hash(served));
     }
 }

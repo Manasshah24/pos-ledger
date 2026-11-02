@@ -134,6 +134,7 @@ public class EventIngestorTests : IClassFixture<PostgresFixture>
         var batch = Raws(Enumerable.Range(0, 100).Select(i => Incoming($"e{i:D3}")).Append(Incoming("poison")).ToArray());
         await Assert.ThrowsAsync<PostgresException>(() => Ingestor(db).IngestAsync(batch));
         Assert.Equal(0, await CountAsync(db, "events")); // all or nothing
+        Assert.Equal(0, await CountAsync(db, "store_day_totals")); // and the totals never moved
 
         await using (var conn = await db.OpenConnectionAsync()) await conn.ExecuteAsync("DROP TRIGGER poison ON events");
         Assert.Equal(101, (await Ingestor(db).IngestAsync(batch)).Inserted); // the terminal resends the batch

@@ -14,6 +14,7 @@ builder.Services.AddSingleton<IClock, SystemClock>();
 builder.Services.AddSingleton(builder.Configuration.GetSection("Ledger").Get<LedgerOptions>() ?? new LedgerOptions());
 builder.Services.AddSingleton<EventIngestor>();
 builder.Services.AddSingleton<StoreRegistry>();
+builder.Services.AddSingleton<TotalsQuery>();
 
 var app = builder.Build();
 
@@ -65,6 +66,18 @@ app.MapPost("/events/batch", async (HttpRequest request, EventIngestor ingestor,
 
     var result = await ingestor.IngestAsync(parsed.Events, ct);
     return Results.Ok(new { inserted = result.Inserted, duplicates = result.Duplicates, rejected = result.Rejected });
+});
+
+app.MapGet("/totals", async (string? storeId, TotalsQuery totals, CancellationToken ct) =>
+    Results.Ok(await totals.GetAsync(storeId, ct)));
+
+app.MapGet("/stores/{storeId}/days/{date}", async (string storeId, string date, TotalsQuery totals, CancellationToken ct) =>
+{
+    if (!DateOnly.TryParseExact(date, "yyyy-MM-dd", out var day))
+        return Results.BadRequest(new { error = "invalid_date" });
+
+    var row = (await totals.GetAsync(storeId, ct)).FirstOrDefault(t => t.BusinessDate == day);
+    return row is null ? Results.NotFound() : Results.Ok(row);
 });
 
 app.Run();

@@ -295,10 +295,12 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
   - New open question **Q7**: how stores/time zones reach the ledger (we require `PUT /stores/{id}` first; the panel's harness may need an adapter or a seed list).
 
 ### Stage 2 — Projections: net store-day totals + atomic visibility *(L1, DoD-2)*
-- [ ] `store_day_totals` projection for sale / return / void (+ tender breakdown for giftcard)
-- [ ] Projection applied **in the same transaction** as insert
-- [ ] `GET /stores/{id}/days/{date}` and bulk totals query
-- **Gate:** unit tests for each event type math (partial return, void, return > sale flagged) · concurrency: 50 rps queries during ingest, assert every response equals some *batch-boundary* state (never partial) · money is integer-only test
+- [x] `store_day_totals` projection (sales / returns / voids / generated net, integer minor units); gift card tender breakdown deferred to Stage 6
+- [x] Projection applied **in the same transaction** as insert; only *newly inserted* events add to it (duplicates never double count)
+- [x] `GET /totals[?storeId=]` (one-statement snapshot) and `GET /stores/{id}/days/{yyyy-MM-dd}`
+- **Gate:** unit tests for each event type math · concurrency: ~50 rps queries during ingest through 2 replicas, every response a whole-batch state (never partial) · money is integer-only
+- **Result: PASSED** — 25 core + 21 integration (+10 harness unchanged). New risk tests: totals per business day incl. 01:59:59 vs 02:00:00, replayed batch changes nothing; reader polling ~50 rps via one replica while 2 replicas ingest 60 batches (every observed sum a multiple of the batch size; a REPEATABLE READ check that log sum == totals sum never differs); crash test also asserts totals never moved; the 20k harness stream now compares **served totals** hash to the oracle
+- **Decisions:** return/void are booked to the business day of their own `occurredAt` (matches oracle); totals rows are upserted in (store, day) order so concurrent batches can't deadlock. Stage 3 will change returns/voids so they are *held* until their sale is known (today they apply immediately).
 
 ### Stage 3 — Orphan returns/voids parking *(L1, FR-3)*
 - [ ] `parked_events`; park on missing sale; resolve in same txn when sale arrives
@@ -390,6 +392,7 @@ The PDF mentions the harness only in a few places; there is **no harness on this
 | 2026-11-02 | Stack revisit | Briefly moved to Go; reverted to C#/.NET 10 + Postgres because Go install needs admin (LA password expired) | Part H (harness) added; can start Stage 0 without admin |
 | 2026-11-02 | Stage 0 | PASSED (34 tests) | Portable Postgres 17.2 in tools/; oracle is independent of service code |
 | 2026-11-02 | Stage 1 | PASSED (52 tests, trimmed) | 100k harness stream via 2 replicas = oracle totals at log level |
+| 2026-11-02 | Stage 2 | PASSED (25 core + 10 harness + 21 integration) | Totals projected in the ingest transaction; atomic visibility verified through 2 replicas |
 
 ## PART G — Decisions awaiting your input
 

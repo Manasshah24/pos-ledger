@@ -54,14 +54,21 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
         // 3. Resolve each store's time zone; an unregistered store cannot be given a business day.
         var zones = await LoadZonesAsync(conn, tx, firstById.Values.Select(c => c.Event.StoreId).Distinct().ToArray(), ct);
         var toInsert = new List<Candidate>(firstById.Count);
+        var days = new Dictionary<string, DateOnly>(StringComparer.Ordinal);
         foreach (var c in firstById.Values.OrderBy(c => c.Event.EventId, StringComparer.Ordinal))
         {
-            if (zones.ContainsKey(c.Event.StoreId)) toInsert.Add(c);
+            if (zones.TryGetValue(c.Event.StoreId, out var zone))
+            {
+                toInsert.Add(c);
+                days[c.Event.EventId] = BusinessDay.For(c.Event.OccurredAtUtc, zone, options.BusinessDayCutoffHour);
+            }
             else rejects.Add(new(c.Index, c.Event.EventId, RejectReason.UnknownStore, c.Raw));
         }
 
-        // 4. Append. Anything not returned already existed.
-        var inserted = await InsertAsync(conn, tx, toInsert, zones, ct);
+        // 4. Append. Anything not returned already existed. Only newly appended events touch the totals,
+        //    and they do so in this same transaction, so readers see the log and the totals move together.
+        var inserted = await InsertAsync(conn, tx, toInsert, days, ct);
+        await ApplyTotalsAsync(conn, tx, toInsert.Where(c => inserted.Contains(c.Event.EventId)).Select(c => (c.Event, days[c.Event.EventId])).ToList(), ct);
         var existing = toInsert.Where(c => !inserted.Contains(c.Event.EventId)).ToList();
 
         // 5. Existing ids: same content is a harmless retry, different content is a conflict worth recording.
@@ -99,7 +106,7 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
     }
 
     private async Task<HashSet<string>> InsertAsync(
-        NpgsqlConnection conn, NpgsqlTransaction tx, List<Candidate> rows, Dictionary<string, TimeZoneInfo> zones, CancellationToken ct)
+        NpgsqlConnection conn, NpgsqlTransaction tx, List<Candidate> rows, Dictionary<string, DateOnly> days, CancellationToken ct)
     {
         var inserted = new HashSet<string>(StringComparer.Ordinal);
         if (rows.Count == 0) return inserted;
@@ -122,12 +129,43 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
         cmd.Parameters.AddWithValue("occurred", rows.Select(r => r.Event.OccurredAtUtc.UtcDateTime).ToArray());
         cmd.Parameters.AddWithValue("sale_ids", rows.Select(r => r.Event.SaleId).ToArray());
         cmd.Parameters.AddWithValue("amounts", rows.Select(r => r.Event.AmountMinor).ToArray());
-        cmd.Parameters.AddWithValue("business_dates",
-            rows.Select(r => BusinessDay.For(r.Event.OccurredAtUtc, zones[r.Event.StoreId], options.BusinessDayCutoffHour)).ToArray());
+        cmd.Parameters.AddWithValue("business_dates", rows.Select(r => days[r.Event.EventId]).ToArray());
 
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) inserted.Add(reader.GetString(0));
         return inserted;
+    }
+
+    /// <summary>
+    /// Adds the new events' effect to the store-day totals. Rows are written in (store, day) order by the database so
+    /// two concurrent batches touching the same days take their row locks in the same order and cannot deadlock.
+    /// </summary>
+    private static async Task ApplyTotalsAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx, List<(ValidEvent Event, DateOnly Day)> added, CancellationToken ct)
+    {
+        if (added.Count == 0) return;
+
+        var perDay = added
+            .GroupBy(a => (a.Event.StoreId, a.Day))
+            .Select(g => (g.Key.StoreId, g.Key.Day, Delta: g.Aggregate(default(DayDelta), (sum, a) => sum + DayDelta.For(a.Event))))
+            .ToList();
+
+        await using var cmd = new NpgsqlCommand("""
+            INSERT INTO store_day_totals (store_id, business_date, sales_minor, returns_minor, voids_minor)
+            SELECT t.store_id, t.business_date, t.sales, t.returns, t.voids
+            FROM unnest(@stores, @days, @sales, @returns, @voids) AS t(store_id, business_date, sales, returns, voids)
+            ORDER BY t.store_id, t.business_date
+            ON CONFLICT (store_id, business_date) DO UPDATE SET
+                sales_minor   = store_day_totals.sales_minor   + EXCLUDED.sales_minor,
+                returns_minor = store_day_totals.returns_minor + EXCLUDED.returns_minor,
+                voids_minor   = store_day_totals.voids_minor   + EXCLUDED.voids_minor
+            """, conn, tx);
+        cmd.Parameters.AddWithValue("stores", perDay.Select(p => p.StoreId).ToArray());
+        cmd.Parameters.AddWithValue("days", perDay.Select(p => p.Day).ToArray());
+        cmd.Parameters.AddWithValue("sales", perDay.Select(p => p.Delta.Sales).ToArray());
+        cmd.Parameters.AddWithValue("returns", perDay.Select(p => p.Delta.Returns).ToArray());
+        cmd.Parameters.AddWithValue("voids", perDay.Select(p => p.Delta.Voids).ToArray());
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     private static async Task<Dictionary<string, ValidEvent>> LoadStoredAsync(
