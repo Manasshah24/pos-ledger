@@ -206,7 +206,7 @@ These shape the code; we design so the answer only touches one adapter layer.
 
 ### C1. Decisions (final: C# / .NET 10, because it needs zero admin installs)
 
-**Why .NET now:** Go's installer needs admin rights and the LA account password is expired. .NET 10 SDK is already installed and works, NuGet is reachable (nuget.org returns 200), and the language matters less than people think here: Postgres does the hard work (unique index = idempotency, row locks = lease/close races, transactions = atomic batches). C# gives `long` money, good concurrency tooling and fast development. Go stays documented as the alternative we considered.
+**Why .NET now:** Go's installer needs administrator rights, which were not available on the build machine. .NET 10 SDK is already installed and works, NuGet is reachable (nuget.org returns 200), and the language matters less than people think here: Postgres does the hard work (unique index = idempotency, row locks = lease/close races, transactions = atomic batches). C# gives `long` money, good concurrency tooling and fast development. Go stays documented as the alternative we considered.
 
 | Concern | Choice | Why / rejected alternatives |
 |---------|--------|-----------------------------|
@@ -408,7 +408,7 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 - [x] Design doc (`docs/design.md`): components, data model, consistency model, failure modes, left out, and where the build changed course
 - [x] README (run, test, API, known limits, next steps), judge guide (`docs/judge-guide.md`: which test proves each DoD item), build log (this file)
 - [x] CI workflow (`.github/workflows/ci.yml`: build + all tests against a Postgres service, compose build)
-- [ ] Plug in the panel's real harness via adapter; fix format deltas (Q1–Q7) — **cannot be done until the harness is available**
+- [ ] Plug in the panel's real harness via adapter; fix format deltas (Q1–Q7) — **cannot be done until the harness is available; plan written in `docs/harness-adapter-plan.md`**
 - [ ] Push to your personal GitHub — **needs your repo URL and a personal author email** (commits are currently authored with the work email)
 - [ ] Build `Name_P2.zip` → hr.india@aptos.com — **a submission to a third party: not done, needs your go-ahead and your name for the file**
 - **Gate:** fresh clone → `docker compose up` → tests green *(compose and failover verified by hand in Stage 10; the panel harness has not been run against it)*
@@ -420,7 +420,7 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 | Date | Stage | Result | Notes |
 |------|-------|--------|-------|
 | 2026-11-02 | Analysis | Part A–E written | Awaiting instructions to start Stage 0 |
-| 2026-11-02 | Stack revisit | Briefly moved to Go; reverted to C#/.NET 10 + Postgres because Go install needs admin (LA password expired) | Part H (harness) added; can start Stage 0 without admin |
+| 2026-11-02 | Stack revisit | Briefly moved to Go; reverted to C#/.NET 10 + Postgres because the Go install needs administrator rights, which were not available | Part H (harness) added; can start Stage 0 without admin |
 | 2026-11-02 | Stage 0 | PASSED (34 tests) | Portable Postgres 17.2 in tools/; oracle is independent of service code |
 | 2026-11-02 | Stage 1 | PASSED (52 tests, trimmed) | 100k harness stream via 2 replicas = oracle totals at log level |
 | 2026-11-02 | Stage 2 | PASSED (25 core + 10 harness + 21 integration) | Totals projected in the ingest transaction; atomic visibility verified through 2 replicas |
@@ -439,5 +439,5 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 - [ ] Postgres source: portable zip (no admin) or Docker once engine works
 - [ ] Confirm UI = thin static dashboard, late and cut-able
 - [ ] Per-event reject vs whole-batch reject on a malformed event (default: per-event)
-- [ ] Repo location/name (default: `C:\Users\mshah\Desktop\pos-ledger`, GitHub later)
+- [x] Repo: `pos-ledger`, pushed to GitHub
 - [ ] Do we disclose AI-assistant use to the panel (rule says say so)
