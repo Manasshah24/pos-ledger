@@ -1,4 +1,7 @@
 <Solution>
+  <Folder Name="/bench/">
+    <Project Path="bench/Ledger.Bench/Ledger.Bench.csproj" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/Ledger.Api/Ledger.Api.csproj" />
     <Project Path="src/Ledger.Core/Ledger.Core.csproj" />

@@ -177,7 +177,7 @@ public class GiftCardTests : IClassFixture<PostgresFixture>
         Assert.Contains(flags, f => f.Kind == "overspend"); // and legitimate overspend actually happened, so the bound was exercised
 
         // Gift redemptions are not revenue: rebuilding the totals from the log still works and nothing about them changed.
-        Assert.True((await new Rebuilder(rig.Db).RebuildAsync()).Identical);
+        Assert.True((await new Rebuilder(rig.Db, rig.Clock).RebuildAsync()).Identical);
     }
 
     [Fact]

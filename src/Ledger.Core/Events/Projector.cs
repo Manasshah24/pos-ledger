@@ -18,6 +18,19 @@ public sealed record ProjectedParked(string EventId, string StoreId, string Sale
 /// <summary>A loyalty account as the sum of its distinct earn and burn events (a PN-counter: both only ever grow).</summary>
 public sealed record ProjectedLoyalty(string AccountId, long Earned, long Burned);
 
+/// <summary>
+/// The projection's state at a snapshot, so a replay can start there instead of at the beginning of the log.
+/// KnownSales only needs the sales that events after the snapshot refer to; OpenParked are the returns/voids still waiting
+/// for their sale at the snapshot; LastClosed is each store's last closed day at the snapshot.
+/// </summary>
+public sealed record ProjectionSeed(
+    IReadOnlyList<ProjectedDay> Days,
+    IReadOnlyList<ProjectedAdjustment> Adjustments,
+    IReadOnlyList<ProjectedLoyalty> Loyalty,
+    IReadOnlyDictionary<string, DateOnly> LastClosed,
+    IReadOnlyList<LogEvent> OpenParked,
+    IReadOnlySet<(string Store, string Sale)> KnownSales);
+
 public sealed record Projection(
     IReadOnlyList<ProjectedDay> Days,
     IReadOnlyList<ProjectedAdjustment> Adjustments,
@@ -36,7 +49,11 @@ public sealed record Projection(
 /// </summary>
 public static class Projector
 {
-    public static Projection Replay(IEnumerable<LogEvent> events, IEnumerable<ClosureMark> closures)
+    /// <param name="events">Events after the seed (or all events), in log order unless <paramref name="alreadyOrdered"/> is false.</param>
+    /// <param name="closures">Closes recorded after the seed (or all closes), in the order they happened.</param>
+    /// <param name="seed">State at a snapshot to continue from; null starts from an empty projection.</param>
+    /// <param name="alreadyOrdered">True when the events are already in log_seq order, so they can be streamed without buffering.</param>
+    public static Projection Replay(IEnumerable<LogEvent> events, IEnumerable<ClosureMark> closures, ProjectionSeed? seed = null, bool alreadyOrdered = false)
     {
         var closuresByStore = closures.GroupBy(c => c.StoreId, StringComparer.Ordinal)
             .ToDictionary(g => g.Key, g => new Queue<ClosureMark>(g), StringComparer.Ordinal);
@@ -47,6 +64,21 @@ public static class Projector
         var days = new Dictionary<(string Store, DateOnly Day), (DayDelta Own, DayDelta Adj)>();
         var adjustments = new List<ProjectedAdjustment>();
         var loyalty = new Dictionary<string, (long Earned, long Burned)>(StringComparer.Ordinal);
+
+        if (seed is not null)
+        {
+            foreach (var d in seed.Days) days[(d.StoreId, d.Day)] = (d.Own, d.Adjustments);
+            adjustments.AddRange(seed.Adjustments);
+            foreach (var l in seed.Loyalty) loyalty[l.AccountId] = (l.Earned, l.Burned);
+            foreach (var (store, closed) in seed.LastClosed) lastClosed[store] = closed;
+            knownSales.UnionWith(seed.KnownSales);
+            foreach (var p in seed.OpenParked)
+            {
+                if (!parkedBySale.TryGetValue((p.StoreId, p.SaleId), out var list)) parkedBySale[(p.StoreId, p.SaleId)] = list = [];
+                list.Add(p);
+                parkedRecords[p.EventId] = new ProjectedParked(p.EventId, p.StoreId, p.SaleId, null);
+            }
+        }
 
         void Apply(LogEvent e)
         {
@@ -65,7 +97,7 @@ public static class Projector
             }
         }
 
-        foreach (var e in events.OrderBy(e => e.LogSeq))
+        foreach (var e in alreadyOrdered ? events : events.OrderBy(e => e.LogSeq))
         {
             // Closes that happened before this event was appended take effect first.
             if (closuresByStore.TryGetValue(e.StoreId, out var queue))

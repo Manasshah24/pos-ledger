@@ -365,9 +365,29 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 - **Decisions:** "negative" is a reported state, not a per-event flag, so it does not depend on arrival order (unlike gift card overspend flags). Online loyalty burns and online gift card redemptions share one small event-appender helper, so both take locks in the same order as batch ingest (events first, then the account/card row) and cannot deadlock with it.
 
 ### Stage 8 — Snapshots for fast rebuild at 10M events *(L3)*
-- [ ] Snapshot table (`log_seq`, hash); rebuild = snapshot + tail
-- [ ] Synthetic 10M-event load benchmark (documented timing)
-- **Gate:** snapshot-rebuild hash == full-rebuild hash · crash-safe snapshot (partial snapshot never used) · benchmark result recorded in docs
+- [x] `POST /admin/snapshot`: copies the read models (totals, adjustments, loyalty, still-parked ids, each store's last closed day) with the log position (`log_seq`, `last_closure_id`) and their hashes, in **one transaction** while every store is locked, so a snapshot that did not finish never becomes visible. Cost is a copy of the read models, not a replay of the log (0.1 s at 1M events).
+- [x] `POST /admin/rebuild?useSnapshot=true`: loads the latest snapshot, **verifies its rows still hash to what was recorded**, then replays only events after it. A snapshot that fails verification is ignored, reported (`snapshotRejected`) and the rebuild falls back to the whole log; the answer is still right.
+- [x] The pure `Projector` can resume from a seed (the state at a snapshot), so the same rules run for a full replay and a tail replay. Full replays now stream events from the database instead of loading them all into memory.
+- **Gate:** snapshot-rebuild hash == full-rebuild hash · crash-safe snapshot (partial never used) · benchmark result recorded
+- **Result: PASSED** — 34 core + 10 harness + 50 integration (3 new + 1 property). Key tests: a 10k-delivery harness stream with orphans, a close **before** the snapshot, more events, a second close and loyalty **after** it → live == full rebuild == snapshot rebuild, repeatable, replaying under 70% of the events; a property test over 100 random histories (sales, returns/voids before or without their sale, closes, loyalty) cut at a random point: **resuming from a seed == replaying everything**; a snapshot killed mid-write leaves nothing and rebuilds fall back; a corrupted snapshot is detected, ignored and reported.
+- **Benchmark** (`dotnet run -c Release --project bench/Ledger.Bench -- 1000000 20000`; this laptop, local Postgres 17 with fsync off, one process):
+
+| Step | Time |
+|------|-----:|
+| Load 1,000,000 events into the log (bulk SQL) | 116 s |
+| Rebuild all read models from the whole log (1,000,000 events) | **6.8 s** (peak process memory 183 MB) |
+| Take a snapshot | 0.1 s |
+| Ingest 20,000 more events through the real ingest path | 9.2 s (~2,170 events/s) |
+| Rebuild from snapshot + 20,000-event tail | **1.0 s** |
+| Rebuild from the whole log again (1,020,000 events) | 5.6 s |
+
+  Hashes were identical across live, snapshot rebuild and full rebuild. **Measured only at 1M events.** The full rebuild scales roughly linearly (~7 s per million, so about 70 s at 10M, with memory growing to well over 1 GB because it remembers every sale id); the snapshot rebuild depends on the tail since the snapshot, not on the size of the log, so it stays at about a second for a tail of this size. These 10M figures are an extrapolation, not a measurement. The one-off bulk load is the slow part and is not the rebuild being timed.
+- **Limits / decisions**
+  - Snapshots are taken on demand (an admin endpoint); a scheduler and retention policy (delete old snapshots) are not built.
+  - Taking a snapshot or rebuilding holds every store's lock, so ingest and day close wait for it (reads do not).
+  - Snapshots cover the totals, adjustment, loyalty and parked read models; gift card state is still not part of the rebuild.
+  - A first benchmark run printed a wrong throughput figure (it divided by the previous step's time); fixed, and the number above is computed from the measured 9.2 s.
+  - Found while doing this: `Program.cs` had a stray NUL byte inside a character literal (from an earlier scripted edit); replaced with `\0`.
 
 ### Stage 9 — Full-system chaos & load verification
 - [ ] Run our 100k harness against **2 replicas** behind nginx: DoD-1..5 as one automated suite
@@ -434,6 +454,7 @@ The PDF mentions the harness only in a few places; there is **no harness on this
 | 2026-11-03 | Stage 5 | PASSED (30 core + 10 harness + 36 integration) | Pure replay == live incremental on all read models; wipe+rebuild identical; sale identity scoped per store |
 | 2026-11-03 | Stage 6 | PASSED (31 core + 10 harness + 42 integration) | Leases (secured+unsecured), reservation = expiry+48h, overspend flags; 40-card concurrent scenario within limit |
 | 2026-11-03 | Stage 7 | PASSED (33 core + 10 harness + 47 integration) | PN-counter loyalty balances; negative policy; included in rebuild hash |
+| 2026-11-03 | Stage 8 | PASSED (34 core + 10 harness + 50 integration) | Verified snapshots; tail replay; 1M-event benchmark: full rebuild 6.8 s vs 1.0 s from snapshot |
 
 ## PART G — Decisions awaiting your input
 

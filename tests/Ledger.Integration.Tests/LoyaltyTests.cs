@@ -114,7 +114,7 @@ public class LoyaltyTests : IClassFixture<PostgresFixture>
     {
         await using var db = await NewDb();
         var ingestor = Ingestor(db);
-        var rebuilder = new Rebuilder(db);
+        var rebuilder = new Rebuilder(db, new ManualClock(Noon));
         await ingestor.IngestAsync(Raws(
             Incoming("sale1", "S1", amount: 1000, sale: "s1"), Earn("e1", "S1", "a1", 100), Earn("e2", "S2", "a1", 50),
             Burn("b1", "S3", "a1", 400), Earn("e3", "S3", "a2", 7)));
