@@ -10,8 +10,9 @@ x-api: &api
     # Pool of 40 per replica so two replicas stay well inside Postgres's max_connections.
     ConnectionStrings__Ledger: "Host=postgres;Port=5432;Username=ledger;Password=ledger;Database=ledger;Maximum Pool Size=40"
     # Close each store's business day automatically at 02:00 local time (checked every 60 s on every replica).
-    # Set to 0 to close days only through POST /admin/stores/{id}/close, e.g. when replaying old simulated timestamps.
-    Ledger__AutoCloseIntervalSeconds: "60"
+    # Set AUTO_CLOSE_SECONDS=0 to close days only through POST /admin/stores/{id}/close, e.g. when replaying old simulated
+    # timestamps against the real clock (otherwise every old day is closed within a minute and late events become adjustments).
+    Ledger__AutoCloseIntervalSeconds: "${AUTO_CLOSE_SECONDS:-60}"
     # Largest unsecured overspend allowed per gift card for offline redemptions, in minor units. 0 = strict.
     Ledger__OfflineUnsecuredLimitMinor: "0"
   healthcheck:

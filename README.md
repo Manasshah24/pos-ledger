@@ -13,7 +13,7 @@ docker compose up --build        # postgres + 2 API replicas + nginx
 # dashboard:  http://localhost:8080          health: http://localhost:8080/health
 ```
 
-> The compose files have been validated for syntax but **have not been run end to end**: the Docker engine was not available on the machine this was developed on. Everything below was verified without Docker (two real API processes against one Postgres).
+> Verified on Docker Desktop: the images build, Postgres/both replicas report healthy, nginx serves the API and the dashboard, and killing a replica container mid-traffic loses nothing (see the build log, Stage 10). The day-close scheduler is on (every 60 s); start with `AUTO_CLOSE_SECONDS=0 docker compose up` to close days only through the admin endpoints, e.g. when replaying old simulated timestamps against the real clock.
 
 Without Docker (needs a local PostgreSQL 17):
 
@@ -54,7 +54,7 @@ Configuration (`Ledger:` section / `Ledger__…` environment variables): `Busine
 ## Known limits
 
 * **The panel's harness was not available while building.** Its event format, endpoints and checksum format are unknown; the project was built against its own seeded generator and an independent oracle that mirror the five Definition-of-Done checks. Expect a small adapter in `Ledger.Api` (and possibly the day-close and rebuild triggers) when the real harness is in hand.
-* **Docker not exercised** (see above). **Playwright UI test cut**; the dashboard is a thin read-only page.
+* **Playwright UI test cut**; the dashboard is a thin read-only page. The panel's harness has not been run against the compose stack.
 * Rebuild of 10,000,000 events is **extrapolated**, not measured (1M measured: 6.8 s full, 1.0 s from a snapshot). Snapshots are on demand; no schedule or retention.
 * Gift card guarantee holds for terminals that obey their lease; one that does not is flagged but cannot be stopped. Gift card state is not in the rebuild hash. Returns at a different store than the sale are not supported.
 * A return larger than its sale's remaining amount is not flagged.

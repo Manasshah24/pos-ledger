@@ -394,12 +394,14 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 - [x] A replica is destroyed with the equivalent of `kill -9` (process tree killed, no cleanup) once a quarter of the batches are in, left down for 3 s, then restarted; terminals retry unacknowledged batches on whichever replica answers
 - [x] Queries at ~50 requests/s on the surviving replica throughout, plus a REPEATABLE READ check that sales in the log always equal sales in the totals
 - **Result: PASSED** — the kill really interrupted requests (asserted), nobody saw a partly applied batch, the surviving replica answered every query, **not one event lost or duplicated** (log == unique events, nothing rejected), every store-day total equals the independent oracle, `/parked` empty, and a rebuild afterwards is identical to live.
-- **Not done:** repeating with several seeds (one seed is in the suite; others can be run by changing the seed); docker-level `docker kill` (Docker unavailable here), nginx failover untested.
+- **Not done:** repeating with several seeds (one seed is in the suite; others can be run by changing the seed). Container-level `docker kill` + nginx failover is covered in Stage 10.
 
 ### Stage 10 — Docker, deployment & UI polish
 - [x] `Dockerfile` (multi-stage .NET 10, installs tzdata for IANA zones), `docker-compose.yml` (Postgres 17 with `max_connections=200`, `api1` + `api2` with per-replica pool of 40 and health checks, nginx with failover to the other replica), `deploy/nginx.conf`
 - [x] Ops dashboard (`wwwroot/index.html`): store-day totals, parked returns, gift card flags, loyalty debt; served by the API (tested)
-- [ ] **Not verified: `docker compose up` was never run** — the Docker engine could not be started on this machine. `docker compose config` accepts the file and the same two-process topology is proven by `ChaosTests`, but the image build and nginx path are untested. Do this first on a machine with Docker.
+- [x] **`docker compose up --build` verified** (Docker Desktop 29.8): both images build, Postgres and both replicas turn healthy, nginx on `localhost:8080` serves `/health`, the dashboard and the API; a sale + return + replay + close + rebuild walk-through through nginx gave the right answers (replay = duplicate, rebuild identical).
+- [x] **Failover through nginx verified**, and it needed two fixes found by doing it: (1) nginx does not replay a POST that died mid-request unless told to, so `proxy_next_upstream … non_idempotent` was added (safe: every write is idempotent); (2) a killed container is *unreachable*, not *refusing*, so nginx waited out a long connect timeout and two requests hung for 20 s; `proxy_connect_timeout 2s` fixed it. After the fix: 200 batches sent through nginx while `docker kill` destroyed one replica → **200/200 accepted, exactly 1,000 events landed**.
+- [x] Compose now reads `AUTO_CLOSE_SECONDS` (default 60). Noticed live: with the scheduler on, events dated January were closed within a minute (real clock is November) and landed as adjustments — correct behaviour, but it is why a replay of old simulated timestamps should start with `AUTO_CLOSE_SECONDS=0`.
 - [ ] Playwright UI smoke test — **cut on purpose** (rubric does not score UI)
 
 ### Stage 11 — Judge documentation & delivery
@@ -409,7 +411,7 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 - [ ] Plug in the panel's real harness via adapter; fix format deltas (Q1–Q7) — **cannot be done until the harness is available**
 - [ ] Push to your personal GitHub — **needs your repo URL and a personal author email** (commits are currently authored with the work email)
 - [ ] Build `Name_P2.zip` → hr.india@aptos.com — **a submission to a third party: not done, needs your go-ahead and your name for the file**
-- **Gate:** fresh clone → `docker compose up` → tests green *(compose half unverified, see Stage 10)*
+- **Gate:** fresh clone → `docker compose up` → tests green *(compose and failover verified by hand in Stage 10; the panel harness has not been run against it)*
 
 ---
 
@@ -429,7 +431,7 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
 | 2026-11-03 | Stage 7 | PASSED (33 core + 10 harness + 47 integration) | PN-counter loyalty balances; negative policy; included in rebuild hash |
 | 2026-11-03 | Stage 8 | PASSED (34 core + 10 harness + 50 integration) | Verified snapshots; tail replay; 1M-event benchmark: full rebuild 6.8 s vs 1.0 s from snapshot |
 | 2026-11-03 | Stage 9 | PASSED (ChaosTests, 59 s) | 100k replay through 2 real processes, one killed midway; nothing lost |
-| 2026-11-03 | Stage 10-11 | Written, partly unverified | Dockerfile/compose/nginx/dashboard/docs/CI written; compose never run (no Docker engine); GitHub push, harness adapter, zip pending the user |
+| 2026-11-03 | Stage 10-11 | Compose verified | Stack builds and runs on Docker Desktop; nginx failover fixed (non_idempotent + 2 s connect timeout) and verified 200/200 with a replica killed; pushed to GitHub; harness adapter and zip pending |
 
 ## PART G — Decisions awaiting your input
 
