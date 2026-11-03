@@ -4,7 +4,7 @@ using System.Text;
 
 namespace Ledger.Core.Events;
 
-public sealed record ProjectionHashes(string Totals, string Adjustments, string Parked, string Overall);
+public sealed record ProjectionHashes(string Totals, string Adjustments, string Parked, string Loyalty, string Overall);
 
 /// <summary>
 /// SHA-256 fingerprints of the read models. Each model becomes one text line per row (fixed field order, integers only,
@@ -22,18 +22,23 @@ public static class ProjectionHash
     /// <summary>Only events still waiting for their sale: who was parked and later released is history, not state.</summary>
     public static string ParkedLine(string eventId) => eventId;
 
+    public static string LoyaltyLine(string accountId, long earned, long burned) => string.Join('|', accountId, earned, burned);
+
     public static ProjectionHashes Of(Projection p) => Of(
         p.Days.Select(d => TotalsLine(d.StoreId, d.Day, d.Own, d.Adjustments)),
         p.Adjustments.Select(a => AdjustmentLine(a.EventId, a.StoreId, a.OriginalDate, a.AppliedDate, a.Delta)),
-        p.Parked.Where(x => x.ReleasedBy is null).Select(x => ParkedLine(x.EventId)));
+        p.Parked.Where(x => x.ReleasedBy is null).Select(x => ParkedLine(x.EventId)),
+        p.Loyalty.Select(l => LoyaltyLine(l.AccountId, l.Earned, l.Burned)));
 
-    public static ProjectionHashes Of(IEnumerable<string> totalsLines, IEnumerable<string> adjustmentLines, IEnumerable<string> parkedLines)
+    public static ProjectionHashes Of(
+        IEnumerable<string> totalsLines, IEnumerable<string> adjustmentLines, IEnumerable<string> parkedLines, IEnumerable<string> loyaltyLines)
     {
         var totals = Sha(totalsLines);
         var adjustments = Sha(adjustmentLines);
         var parked = Sha(parkedLines);
-        var overall = Sha([$"totals:{totals}", $"adjustments:{adjustments}", $"parked:{parked}"], sort: false);
-        return new ProjectionHashes(totals, adjustments, parked, overall);
+        var loyalty = Sha(loyaltyLines);
+        var overall = Sha([$"totals:{totals}", $"adjustments:{adjustments}", $"parked:{parked}", $"loyalty:{loyalty}"], sort: false);
+        return new ProjectionHashes(totals, adjustments, parked, loyalty, overall);
     }
 
     private static string Date(DateOnly d) => d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);

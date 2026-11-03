@@ -1,7 +1,9 @@
 namespace Ledger.Core.Events;
 
 /// <summary>One event as the replay sees it. BusinessDate was fixed when the event was appended.</summary>
-public sealed record LogEvent(long LogSeq, string EventId, string StoreId, string Type, DateOnly BusinessDate, string SaleId, long AmountMinor);
+public sealed record LogEvent(
+    long LogSeq, string EventId, string StoreId, string Type, DateOnly BusinessDate, string SaleId, long AmountMinor,
+    string? AccountId = null, long Points = 0);
 
 /// <summary>A day close: every day up to ThroughDate closed after the store's events with LogSeq at or below LogSeqMark.</summary>
 public sealed record ClosureMark(string StoreId, long LogSeqMark, DateOnly ThroughDate);
@@ -13,10 +15,14 @@ public sealed record ProjectedAdjustment(string EventId, string StoreId, DateOnl
 /// <summary>A return/void that arrived before its sale. ReleasedBy is the sale event that freed it, or null while still waiting.</summary>
 public sealed record ProjectedParked(string EventId, string StoreId, string SaleId, string? ReleasedBy);
 
+/// <summary>A loyalty account as the sum of its distinct earn and burn events (a PN-counter: both only ever grow).</summary>
+public sealed record ProjectedLoyalty(string AccountId, long Earned, long Burned);
+
 public sealed record Projection(
     IReadOnlyList<ProjectedDay> Days,
     IReadOnlyList<ProjectedAdjustment> Adjustments,
-    IReadOnlyList<ProjectedParked> Parked);
+    IReadOnlyList<ProjectedParked> Parked,
+    IReadOnlyList<ProjectedLoyalty> Loyalty);
 
 /// <summary>
 /// Rebuilds every read model from the event log. It is a pure function of the log (events in log_seq order plus the recorded
@@ -40,6 +46,7 @@ public static class Projector
         var parkedRecords = new Dictionary<string, ProjectedParked>(StringComparer.Ordinal);
         var days = new Dictionary<(string Store, DateOnly Day), (DayDelta Own, DayDelta Adj)>();
         var adjustments = new List<ProjectedAdjustment>();
+        var loyalty = new Dictionary<string, (long Earned, long Burned)>(StringComparer.Ordinal);
 
         void Apply(LogEvent e)
         {
@@ -68,7 +75,12 @@ public static class Projector
                     if (!lastClosed.TryGetValue(e.StoreId, out var cur) || through > cur) lastClosed[e.StoreId] = through;
                 }
 
-            if (e.Type == EventType.Sale)
+            if (EventType.IsLoyalty(e.Type))
+            {
+                var cur = loyalty.GetValueOrDefault(e.AccountId!);
+                loyalty[e.AccountId!] = e.Type == EventType.LoyaltyEarn ? (cur.Earned + e.Points, cur.Burned) : (cur.Earned, cur.Burned + e.Points);
+            }
+            else if (e.Type == EventType.Sale)
             {
                 Apply(e);
                 knownSales.Add((e.StoreId, e.SaleId));
@@ -95,6 +107,7 @@ public static class Projector
             days.OrderBy(d => d.Key.Store, StringComparer.Ordinal).ThenBy(d => d.Key.Day)
                 .Select(d => new ProjectedDay(d.Key.Store, d.Key.Day, d.Value.Own, d.Value.Adj)).ToList(),
             adjustments.OrderBy(a => a.EventId, StringComparer.Ordinal).ToList(),
-            parkedRecords.Values.OrderBy(p => p.EventId, StringComparer.Ordinal).ToList());
+            parkedRecords.Values.OrderBy(p => p.EventId, StringComparer.Ordinal).ToList(),
+            loyalty.OrderBy(l => l.Key, StringComparer.Ordinal).Select(l => new ProjectedLoyalty(l.Key, l.Value.Earned, l.Value.Burned)).ToList());
     }
 }

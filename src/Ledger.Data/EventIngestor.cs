@@ -133,10 +133,10 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
         if (rows.Count == 0) return inserted;
 
         await using var cmd = new NpgsqlCommand("""
-            INSERT INTO events (event_id, store_id, terminal_id, type, occurred_at, received_at, sale_id, amount_minor, business_date, card_id, lease_id)
-            SELECT t.event_id, t.store_id, t.terminal_id, t.type, t.occurred_at, @received_at, t.sale_id, t.amount_minor, t.business_date, t.card_id, t.lease_id
-            FROM unnest(@event_ids, @store_ids, @terminal_ids, @types, @occurred, @sale_ids, @amounts, @business_dates, @card_ids, @lease_ids)
-                 WITH ORDINALITY AS t(event_id, store_id, terminal_id, type, occurred_at, sale_id, amount_minor, business_date, card_id, lease_id, ord)
+            INSERT INTO events (event_id, store_id, terminal_id, type, occurred_at, received_at, sale_id, amount_minor, business_date, card_id, lease_id, account_id, points)
+            SELECT t.event_id, t.store_id, t.terminal_id, t.type, t.occurred_at, @received_at, t.sale_id, t.amount_minor, t.business_date, t.card_id, t.lease_id, t.account_id, t.points
+            FROM unnest(@event_ids, @store_ids, @terminal_ids, @types, @occurred, @sale_ids, @amounts, @business_dates, @card_ids, @lease_ids, @account_ids, @points)
+                 WITH ORDINALITY AS t(event_id, store_id, terminal_id, type, occurred_at, sale_id, amount_minor, business_date, card_id, lease_id, account_id, points, ord)
             ORDER BY t.ord
             ON CONFLICT (event_id) DO NOTHING
             RETURNING event_id
@@ -153,6 +153,8 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
         cmd.Parameters.AddWithValue("business_dates", rows.Select(r => days[r.Event.EventId]).ToArray());
         cmd.Parameters.AddWithValue("card_ids", rows.Select(r => r.Event.CardId).ToArray());
         cmd.Parameters.AddWithValue("lease_ids", rows.Select(r => r.Event.LeaseId).ToArray());
+        cmd.Parameters.AddWithValue("account_ids", rows.Select(r => r.Event.AccountId).ToArray());
+        cmd.Parameters.AddWithValue("points", rows.Select(r => r.Event.Points).ToArray());
 
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct)) inserted.Add(reader.GetString(0));
@@ -174,9 +176,40 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
 
         // Gift card redemptions are a tender, not revenue: they never touch the store-day totals.
         var gift = added.Where(a => a.Event.Type == EventType.GiftcardRedeem).Select(a => a.Event).ToList();
-        var trade = added.Where(a => a.Event.Type != EventType.GiftcardRedeem).ToList();
+        var loyalty = added.Where(a => EventType.IsLoyalty(a.Event.Type)).Select(a => a.Event).ToList();
+        var trade = added.Where(a => a.Event.Type != EventType.GiftcardRedeem && !EventType.IsLoyalty(a.Event.Type)).ToList();
         await ProjectTradeAsync(conn, tx, stores, trade, ct);
         await ApplyGiftCardsAsync(conn, tx, gift, ct);
+        await ApplyLoyaltyAsync(conn, tx, loyalty, ct);
+    }
+
+    /// <summary>
+    /// Adds new loyalty events to their accounts' earned and burned totals. Both only ever grow and only newly appended events
+    /// are applied, so the balance is a sum over the distinct events: the same whatever order or number of times they arrive.
+    /// Accounts are written in sorted order so concurrent batches take their row locks in the same order.
+    /// </summary>
+    private static async Task ApplyLoyaltyAsync(NpgsqlConnection conn, NpgsqlTransaction tx, List<ValidEvent> events, CancellationToken ct)
+    {
+        if (events.Count == 0) return;
+
+        var perAccount = events.GroupBy(e => e.AccountId!, StringComparer.Ordinal)
+            .Select(g => (Account: g.Key,
+                Earned: g.Where(e => e.Type == EventType.LoyaltyEarn).Sum(e => e.Points!.Value),
+                Burned: g.Where(e => e.Type == EventType.LoyaltyBurn).Sum(e => e.Points!.Value)))
+            .ToList();
+
+        await using var cmd = new NpgsqlCommand("""
+            INSERT INTO loyalty_accounts (account_id, earned_points, burned_points)
+            SELECT a, e, b FROM unnest(@accounts, @earned, @burned) AS t(a, e, b)
+            ORDER BY a
+            ON CONFLICT (account_id) DO UPDATE SET
+                earned_points = loyalty_accounts.earned_points + EXCLUDED.earned_points,
+                burned_points = loyalty_accounts.burned_points + EXCLUDED.burned_points
+            """, conn, tx);
+        cmd.Parameters.AddWithValue("accounts", perAccount.Select(p => p.Account).ToArray());
+        cmd.Parameters.AddWithValue("earned", perAccount.Select(p => p.Earned).ToArray());
+        cmd.Parameters.AddWithValue("burned", perAccount.Select(p => p.Burned).ToArray());
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     private async Task ProjectTradeAsync(
@@ -450,7 +483,7 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
         var stored = new Dictionary<string, ValidEvent>(StringComparer.Ordinal);
 
         await using var cmd = new NpgsqlCommand(
-            "SELECT event_id, store_id, terminal_id, type, occurred_at, sale_id, amount_minor, card_id, lease_id FROM events WHERE event_id = ANY(@ids)", conn, tx);
+            "SELECT event_id, store_id, terminal_id, type, occurred_at, sale_id, amount_minor, card_id, lease_id, account_id, points FROM events WHERE event_id = ANY(@ids)", conn, tx);
         cmd.Parameters.AddWithValue("ids", ids);
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -465,7 +498,9 @@ public sealed class EventIngestor(NpgsqlDataSource db, IClock clock, LedgerOptio
                 reader.IsDBNull(5) ? null : reader.GetString(5),
                 reader.IsDBNull(6) ? null : reader.GetInt64(6),
                 reader.IsDBNull(7) ? null : reader.GetString(7),
-                reader.IsDBNull(8) ? null : reader.GetInt64(8));
+                reader.IsDBNull(8) ? null : reader.GetInt64(8),
+                reader.IsDBNull(9) ? null : reader.GetString(9),
+                reader.IsDBNull(10) ? null : reader.GetInt64(10));
         }
 
         return stored;

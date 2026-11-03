@@ -6,9 +6,13 @@ public static class EventType
     public const string Return = "return";
     public const string Void = "void";
     public const string GiftcardRedeem = "giftcard_redeem";
+    public const string LoyaltyEarn = "loyalty_earn";
+    public const string LoyaltyBurn = "loyalty_burn";
 
-    /// <summary>Types the ledger can currently ingest. Loyalty types join in their own stage.</summary>
-    public static readonly IReadOnlySet<string> Supported = new HashSet<string>(StringComparer.Ordinal) { Sale, Return, Void, GiftcardRedeem };
+    public static readonly IReadOnlySet<string> Supported = new HashSet<string>(StringComparer.Ordinal)
+        { Sale, Return, Void, GiftcardRedeem, LoyaltyEarn, LoyaltyBurn };
+
+    public static bool IsLoyalty(string type) => type is LoyaltyEarn or LoyaltyBurn;
 }
 
 /// <summary>Why an event was refused. Stored with the raw event so nothing is silently dropped.</summary>
@@ -25,6 +29,8 @@ public static class RejectReason
     public const string InvalidOccurredAt = "invalid_occurred_at";
     public const string MissingSaleId = "missing_sale_id";
     public const string MissingCardId = "missing_card_id";
+    public const string MissingAccountId = "missing_account_id";
+    public const string InvalidPoints = "invalid_points";
     public const string InvalidAmount = "invalid_amount";
     public const string InvalidCharacters = "invalid_characters";
     public const string UnknownStore = "unknown_store";
@@ -43,7 +49,9 @@ public sealed record IncomingEvent(
     string? SaleId,
     long? AmountMinor,
     string? CardId = null,
-    long? LeaseId = null);
+    long? LeaseId = null,
+    string? AccountId = null,
+    long? Points = null);
 
 /// <summary>An event that passed validation. OccurredAtUtc is truncated to microseconds, the precision the database stores.</summary>
 public sealed record ValidEvent(
@@ -55,7 +63,9 @@ public sealed record ValidEvent(
     string? SaleId,
     long? AmountMinor,
     string? CardId = null,
-    long? LeaseId = null);
+    long? LeaseId = null,
+    string? AccountId = null,
+    long? Points = null);
 
 public sealed record RejectedEvent(int Index, string? EventId, string Reason);
 

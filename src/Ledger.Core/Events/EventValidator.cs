@@ -28,23 +28,32 @@ public static partial class EventValidator
             || !DateTimeOffset.TryParse(e.OccurredAt, CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed))
             return Fail(RejectReason.InvalidOccurredAt, out reason);
 
-        // sale, return and void reference a sale; a gift card redemption references a card. All carry a positive amount of money.
-        if (e.Type == EventType.GiftcardRedeem)
+        // sale, return and void reference a sale; a gift card redemption references a card; both carry a positive amount of money.
+        // A loyalty earn or burn references an account and carries a positive number of points.
+        if (EventType.IsLoyalty(e.Type))
         {
-            if (string.IsNullOrWhiteSpace(e.CardId)) return Fail(RejectReason.MissingCardId, out reason);
+            if (string.IsNullOrWhiteSpace(e.AccountId)) return Fail(RejectReason.MissingAccountId, out reason);
+            if (e.Points is null or <= 0) return Fail(RejectReason.InvalidPoints, out reason);
         }
-        else if (string.IsNullOrWhiteSpace(e.SaleId)) return Fail(RejectReason.MissingSaleId, out reason);
+        else
+        {
+            if (e.Type == EventType.GiftcardRedeem)
+            {
+                if (string.IsNullOrWhiteSpace(e.CardId)) return Fail(RejectReason.MissingCardId, out reason);
+            }
+            else if (string.IsNullOrWhiteSpace(e.SaleId)) return Fail(RejectReason.MissingSaleId, out reason);
 
-        if (e.AmountMinor is null or <= 0) return Fail(RejectReason.InvalidAmount, out reason);
+            if (e.AmountMinor is null or <= 0) return Fail(RejectReason.InvalidAmount, out reason);
+        }
 
         // Postgres text cannot hold NUL; refuse it here instead of failing the whole batch at the database.
-        if (HasNul(e.EventId) || HasNul(e.StoreId) || HasNul(e.TerminalId) || HasNul(e.SaleId) || HasNul(e.CardId))
+        if (HasNul(e.EventId) || HasNul(e.StoreId) || HasNul(e.TerminalId) || HasNul(e.SaleId) || HasNul(e.CardId) || HasNul(e.AccountId))
             return Fail(RejectReason.InvalidCharacters, out reason);
 
         var utc = parsed.ToUniversalTime();
         utc = utc.AddTicks(-(utc.Ticks % 10)); // Postgres timestamptz keeps microseconds; keep ours identical.
 
-        valid = new ValidEvent(e.EventId, e.StoreId, e.TerminalId, e.Type, utc, e.SaleId, e.AmountMinor, e.CardId, e.LeaseId);
+        valid = new ValidEvent(e.EventId, e.StoreId, e.TerminalId, e.Type, utc, e.SaleId, e.AmountMinor, e.CardId, e.LeaseId, e.AccountId, e.Points);
         reason = null;
         return true;
     }

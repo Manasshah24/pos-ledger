@@ -357,8 +357,12 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
   - Tests cap concurrency at 16 because opening a fresh connection to this local Postgres is slow; they test the logic, not connection storms.
 
 ### Stage 7 — Loyalty convergence *(L3, HC-3, FR-9)*
-- [ ] Per-account earn/burn as PN-counter / event-set; negative policy + flag
-- **Gate:** FsCheck property test: any permutation+duplicates → identical balance (commutative/idempotent/associative) · negative balance flagged, recovers with earns · online burn rejected when it would go negative · included in rebuild hash
+- [x] `loyalty_earn` / `loyalty_burn` events (`accountId`, `points`); `loyalty_accounts` = two grow-only totals (earned, burned) = a **PN-counter**; balance = earned − burned, summed over the *distinct* events in the log, so any merge order and any repeat give the same balance (commutative, associative, idempotent)
+- [x] **Negative-balance policy:** offline burns are always accepted (the purchase already happened), the account may go negative, `GET /loyalty/negative` lists it, later earns pay the debt down automatically, and an **online** burn (`POST /loyalty/{id}/burn`, exact, idempotent on `eventId`) is refused unless the balance covers it, so an account in debt cannot spend until it is back in credit. No clawback.
+- [x] Loyalty is part of the Stage 5 replay, rebuild and hashes (a fourth hash `loyalty`, folded into `overall`)
+- **Gate:** any permutation + duplicates → identical balance · negative balance flagged, recovers with earns · online burn rejected when it would go negative · included in rebuild hash
+- **Result: PASSED** — 33 core + 10 harness + 47 integration (5 new). Key tests: 6 seeded runs of 80 events over 6 accounts and 3 stores, with random repeats, shuffled, cut into random batches and uploaded concurrently through 2 replicas → every account equals the sum of its distinct events; two offline stores each burning 80 of a 100 balance → −60, reported, blocks online burns, repaid by a later earn; 40 concurrent online burns of 10 on a balance of 100 → exactly 10 approved, balance 0; truncate loyalty + totals → rebuild restores both exactly; HTTP walk-through
+- **Decisions:** "negative" is a reported state, not a per-event flag, so it does not depend on arrival order (unlike gift card overspend flags). Online loyalty burns and online gift card redemptions share one small event-appender helper, so both take locks in the same order as batch ingest (events first, then the account/card row) and cannot deadlock with it.
 
 ### Stage 8 — Snapshots for fast rebuild at 10M events *(L3)*
 - [ ] Snapshot table (`log_seq`, hash); rebuild = snapshot + tail
@@ -429,6 +433,7 @@ The PDF mentions the harness only in a few places; there is **no harness on this
 | 2026-11-02 | Stage 4 | PASSED (27 core + 10 harness + 33 integration) | Per-store advisory lock; adjustments linked to original day; DB guard on closed days |
 | 2026-11-03 | Stage 5 | PASSED (30 core + 10 harness + 36 integration) | Pure replay == live incremental on all read models; wipe+rebuild identical; sale identity scoped per store |
 | 2026-11-03 | Stage 6 | PASSED (31 core + 10 harness + 42 integration) | Leases (secured+unsecured), reservation = expiry+48h, overspend flags; 40-card concurrent scenario within limit |
+| 2026-11-03 | Stage 7 | PASSED (33 core + 10 harness + 47 integration) | PN-counter loyalty balances; negative policy; included in rebuild hash |
 
 ## PART G — Decisions awaiting your input
 

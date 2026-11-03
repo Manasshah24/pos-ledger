@@ -36,6 +36,24 @@ public class ProjectorTests
     }
 
     [Fact]
+    public void Loyalty_accounts_are_the_sum_of_distinct_earn_and_burn_events_in_any_order()
+    {
+        LogEvent Loyalty(long seq, string id, string type, string account, long points) =>
+            new(seq, id, "S1", type, Jan5, "", 0, account, points);
+        LogEvent[] events =
+        [
+            Loyalty(1, "e1", EventType.LoyaltyEarn, "a1", 100), Loyalty(2, "b1", EventType.LoyaltyBurn, "a1", 30),
+            Loyalty(3, "b2", EventType.LoyaltyBurn, "a1", 100), Loyalty(4, "e2", EventType.LoyaltyEarn, "a2", 5),
+        ];
+
+        var forward = Projector.Replay(events, []).Loyalty;
+        var backward = Projector.Replay(events.Reverse().Select((e, i) => e with { LogSeq = i + 1 }), []).Loyalty;
+
+        Assert.Equal([new ProjectedLoyalty("a1", 100, 130), new ProjectedLoyalty("a2", 5, 0)], forward); // a1 is 30 in debt
+        Assert.Equal(forward, backward);
+    }
+
+    [Fact]
     public void Events_are_replayed_in_log_order_whatever_order_they_are_supplied()
     {
         LogEvent[] events = [Ev(1, "a", "S1", EventType.Sale, "x", 100), Ev(2, "r", "S1", EventType.Return, "x", 40)];

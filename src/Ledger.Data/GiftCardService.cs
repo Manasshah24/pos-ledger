@@ -139,38 +139,12 @@ public sealed class GiftCardService(NpgsqlDataSource db, IClock clock, LedgerOpt
         }
 
         // Event first, then the card row: the same lock order as batch ingest, so the two paths cannot deadlock.
-        await using (var insert = new NpgsqlCommand("""
-            INSERT INTO events (event_id, store_id, terminal_id, type, occurred_at, received_at, amount_minor, business_date, card_id)
-            VALUES (@id, @store, @terminal, 'giftcard_redeem', @occ, @now, @amt, @day, @card)
-            ON CONFLICT (event_id) DO NOTHING
-            """, conn, tx))
+        var day = BusinessDay.For(valid.OccurredAtUtc, zone, options.BusinessDayCutoffHour);
+        if (!await EventAppender.TryInsertAsync(conn, tx, valid, day, clock.UtcNow.UtcDateTime, ct))
         {
-            insert.Parameters.AddWithValue("id", eventId);
-            insert.Parameters.AddWithValue("store", storeId);
-            insert.Parameters.AddWithValue("terminal", terminalId);
-            insert.Parameters.AddWithValue("occ", valid.OccurredAtUtc.UtcDateTime);
-            insert.Parameters.AddWithValue("now", clock.UtcNow.UtcDateTime);
-            insert.Parameters.AddWithValue("amt", amountMinor);
-            insert.Parameters.AddWithValue("day", BusinessDay.For(valid.OccurredAtUtc, zone, options.BusinessDayCutoffHour));
-            insert.Parameters.AddWithValue("card", cardId);
-
-            if (await insert.ExecuteNonQueryAsync(ct) == 0)
-            {
-                // The same redemption was already approved (a retry), or the id is being reused for something else.
-                await using var existing = new NpgsqlCommand(
-                    "SELECT store_id, terminal_id, type, occurred_at, amount_minor, card_id, lease_id FROM events WHERE event_id = @id", conn, tx);
-                existing.Parameters.AddWithValue("id", eventId);
-                await using var reader = await existing.ExecuteReaderAsync(ct);
-                await reader.ReadAsync(ct);
-                var same = reader.GetString(0) == storeId && reader.GetString(1) == terminalId && reader.GetString(2) == EventType.GiftcardRedeem
-                    && new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(3), DateTimeKind.Utc)) == valid.OccurredAtUtc
-                    && !reader.IsDBNull(4) && reader.GetInt64(4) == amountMinor && !reader.IsDBNull(5) && reader.GetString(5) == cardId && reader.IsDBNull(6);
-                await reader.DisposeAsync();
-                if (!same) return new RedeemResult(RedeemStatus.Conflict, 0, 0, RejectReason.EventIdConflict);
-
-                var current = await ReadBalanceAsync(conn, tx, cardId, ct);
-                return new RedeemResult(RedeemStatus.Replayed, current ?? 0, 0);
-            }
+            // The same redemption was already approved (a retry), or the id is being reused for something else.
+            if (!await EventAppender.SameAsStoredAsync(conn, tx, valid, ct)) return new RedeemResult(RedeemStatus.Conflict, 0, 0, RejectReason.EventIdConflict);
+            return new RedeemResult(RedeemStatus.Replayed, await ReadBalanceAsync(conn, tx, cardId, ct) ?? 0, 0);
         }
 
         long balance;

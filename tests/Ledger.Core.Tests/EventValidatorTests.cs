@@ -34,6 +34,18 @@ public class EventValidatorTests
     }
 
     [Fact]
+    public void A_loyalty_event_needs_an_account_and_a_positive_number_of_points()
+    {
+        var earn = new IncomingEvent("e1", "S1", "T1", EventType.LoyaltyEarn, "2026-01-05T10:00:00Z", null, null, AccountId: "a1", Points: 50);
+
+        Assert.True(EventValidator.TryValidate(earn, out var valid, out _));
+        Assert.Equal(("a1", 50L), (valid.AccountId, valid.Points));
+        Assert.Equal(RejectReason.MissingAccountId, Reason(earn with { AccountId = null }));
+        Assert.Equal(RejectReason.InvalidPoints, Reason(earn with { Points = 0 }));
+        Assert.Equal(RejectReason.InvalidPoints, Reason(earn with { Points = null }));
+    }
+
+    [Fact]
     public void Timestamps_become_utc_microseconds()
     {
         EventValidator.TryValidate(Good() with { OccurredAt = "2026-01-05T15:30:00.1234567+05:30" }, out var valid, out _);

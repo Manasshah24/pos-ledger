@@ -37,11 +37,13 @@ public sealed class Rebuilder(NpgsqlDataSource db)
 
         var events = new List<LogEvent>();
         await using (var cmd = new NpgsqlCommand(
-            "SELECT log_seq, event_id, store_id, type, business_date, sale_id, amount_minor FROM events WHERE type IN ('sale', 'return', 'void') ORDER BY log_seq", conn, tx))
+            "SELECT log_seq, event_id, store_id, type, business_date, sale_id, amount_minor, account_id, points FROM events WHERE type IN ('sale', 'return', 'void', 'loyalty_earn', 'loyalty_burn') ORDER BY log_seq", conn, tx))
         await using (var reader = await cmd.ExecuteReaderAsync(ct))
             while (await reader.ReadAsync(ct))
                 events.Add(new LogEvent(reader.GetInt64(0), reader.GetString(1), reader.GetString(2), reader.GetString(3),
-                    DateOnly.FromDateTime(reader.GetDateTime(4)), reader.GetString(5), reader.GetInt64(6)));
+                    DateOnly.FromDateTime(reader.GetDateTime(4)),
+                    reader.IsDBNull(5) ? "" : reader.GetString(5), reader.IsDBNull(6) ? 0 : reader.GetInt64(6),
+                    reader.IsDBNull(7) ? null : reader.GetString(7), reader.IsDBNull(8) ? 0 : reader.GetInt64(8)));
 
         var closures = new List<ClosureMark>();
         await using (var cmd = new NpgsqlCommand("SELECT store_id, log_seq_mark, through_date FROM day_closures ORDER BY id", conn, tx))
@@ -52,13 +54,14 @@ public sealed class Rebuilder(NpgsqlDataSource db)
         var projection = Projector.Replay(events, closures);
 
         await using (var set = new NpgsqlCommand("SET LOCAL ledger.rebuild = 'on'", conn, tx)) await set.ExecuteNonQueryAsync(ct);
-        foreach (var table in new[] { "adjustments", "store_day_totals", "parked_events" })
+        foreach (var table in new[] { "adjustments", "store_day_totals", "parked_events", "loyalty_accounts" })
             await using (var del = new NpgsqlCommand($"DELETE FROM {table}", conn, tx)) await del.ExecuteNonQueryAsync(ct);
 
         await InsertTotalsAsync(conn, tx, projection.Days, ct);
         await InsertAdjustmentsAsync(conn, tx, projection.Adjustments, ct);
         var open = projection.Parked.Where(p => p.ReleasedBy is null).ToList();
         await InsertParkedAsync(conn, tx, open, ct);
+        await InsertLoyaltyAsync(conn, tx, projection.Loyalty, ct);
 
         var after = await HashTablesAsync(conn, tx, ct);
         await tx.CommitAsync(ct);
@@ -93,7 +96,24 @@ public sealed class Rebuilder(NpgsqlDataSource db)
         await using (var reader = await cmd.ExecuteReaderAsync(ct))
             while (await reader.ReadAsync(ct)) parked.Add(ProjectionHash.ParkedLine(reader.GetString(0)));
 
-        return ProjectionHash.Of(totals, adjustments, parked);
+        var loyalty = new List<string>();
+        await using (var cmd = new NpgsqlCommand("SELECT account_id, earned_points, burned_points FROM loyalty_accounts", conn, tx))
+        await using (var reader = await cmd.ExecuteReaderAsync(ct))
+            while (await reader.ReadAsync(ct)) loyalty.Add(ProjectionHash.LoyaltyLine(reader.GetString(0), reader.GetInt64(1), reader.GetInt64(2)));
+
+        return ProjectionHash.Of(totals, adjustments, parked, loyalty);
+    }
+
+    private static async Task InsertLoyaltyAsync(NpgsqlConnection conn, NpgsqlTransaction tx, IReadOnlyList<ProjectedLoyalty> accounts, CancellationToken ct)
+    {
+        if (accounts.Count == 0) return;
+
+        await using var cmd = new NpgsqlCommand(
+            "INSERT INTO loyalty_accounts (account_id, earned_points, burned_points) SELECT * FROM unnest(@ids, @earned, @burned)", conn, tx);
+        cmd.Parameters.AddWithValue("ids", accounts.Select(a => a.AccountId).ToArray());
+        cmd.Parameters.AddWithValue("earned", accounts.Select(a => a.Earned).ToArray());
+        cmd.Parameters.AddWithValue("burned", accounts.Select(a => a.Burned).ToArray());
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     private static async Task InsertTotalsAsync(NpgsqlConnection conn, NpgsqlTransaction tx, IReadOnlyList<ProjectedDay> days, CancellationToken ct)
