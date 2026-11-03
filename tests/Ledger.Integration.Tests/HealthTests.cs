@@ -13,6 +13,17 @@ public class HealthTests : IClassFixture<PostgresFixture>
         new WebApplicationFactory<Program>().WithWebHostBuilder(b => b.UseSetting("ConnectionStrings:Ledger", connectionString));
 
     [Fact]
+    public async Task The_ops_dashboard_is_served_at_the_root()
+    {
+        await using var app = Replica(_pg.ConnectionString);
+
+        var response = await app.CreateClient().GetAsync("/");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains("POS Ledger", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
     public async Task Two_replicas_start_against_one_database_and_both_report_healthy()
     {
         await using var a = Replica(_pg.ConnectionString);

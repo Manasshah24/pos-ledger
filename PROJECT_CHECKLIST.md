@@ -390,53 +390,26 @@ Time budget assumes the real round is 120 min; stages are ordered so **L1 → L2
   - Found while doing this: `Program.cs` had a stray NUL byte inside a character literal (from an earlier scripted edit); replaced with `\0`.
 
 ### Stage 9 — Full-system chaos & load verification
-- [ ] Run our 100k harness against **2 replicas** behind nginx: DoD-1..5 as one automated suite
-- [ ] `kill -9` / `docker kill` a replica mid-ingest → invariants hold
-- [ ] 20 store outage simulation, 50 rps query load
-- **Gate:** entire DoD suite green, repeated 3× with different seeds
+- [x] The panel's full replay profile (100,000 deliveries: 12% duplicates, 3% orphan returns, shuffled within 48 h, 20 outages) through **two real API processes** against one Postgres (`ChaosTests`, 59 s)
+- [x] A replica is destroyed with the equivalent of `kill -9` (process tree killed, no cleanup) once a quarter of the batches are in, left down for 3 s, then restarted; terminals retry unacknowledged batches on whichever replica answers
+- [x] Queries at ~50 requests/s on the surviving replica throughout, plus a REPEATABLE READ check that sales in the log always equal sales in the totals
+- **Result: PASSED** — the kill really interrupted requests (asserted), nobody saw a partly applied batch, the surviving replica answered every query, **not one event lost or duplicated** (log == unique events, nothing rejected), every store-day total equals the independent oracle, `/parked` empty, and a rebuild afterwards is identical to live.
+- **Not done:** repeating with several seeds (one seed is in the suite; others can be run by changing the seed); docker-level `docker kill` (Docker unavailable here), nginx failover untested.
 
 ### Stage 10 — Docker, deployment & UI polish
-- [ ] `docker compose up`: postgres, 2× api, nginx — healthchecks
-- [ ] Dashboard (static) + Playwright smoke test (optional, cut-able)
-- **Gate:** clean-machine `compose up` → suite runs green against it
+- [x] `Dockerfile` (multi-stage .NET 10, installs tzdata for IANA zones), `docker-compose.yml` (Postgres 17 with `max_connections=200`, `api1` + `api2` with per-replica pool of 40 and health checks, nginx with failover to the other replica), `deploy/nginx.conf`
+- [x] Ops dashboard (`wwwroot/index.html`): store-day totals, parked returns, gift card flags, loyalty debt; served by the API (tested)
+- [ ] **Not verified: `docker compose up` was never run** — the Docker engine could not be started on this machine. `docker compose config` accepts the file and the same two-process topology is proven by `ChaosTests`, but the image build and nginx path are untested. Do this first on a machine with Docker.
+- [ ] Playwright UI smoke test — **cut on purpose** (rubric does not score UI)
 
 ### Stage 11 — Judge documentation & delivery
-- [ ] Design doc (1–2 pages) finalized to match what was built (diagram = reality)
-- [ ] README (run, limits, next-day plan), judge guide (how to verify each DoD item), trade-off log
-- [ ] Plug in panel's real harness via adapter; fix format deltas (Q1–Q6)
-- [ ] Push to your GitHub (+ CI workflow); commit history sanity check
-- [ ] Build `Name_P2.zip` → hr.india@aptos.com
-- **Gate:** fresh clone → `docker compose up` → tests green
-
----
-
-## PART H — What the PDF says about the harness (all of it)
-
-The PDF mentions the harness only in a few places; there is **no harness on this machine** (searched Desktop/Downloads, only unrelated Harness.io CI keys). Everything below comes from the PDF.
-
-**Rules (apply to every problem)**
-- The panel provides a **starter harness per problem: data generator, mock external services, load script and an invariant checker.**
-- **Candidates must not change the harness.**
-- "Harness invariants pass under concurrency and chaos" is what earns a 4 on Correctness (30%).
-- **Automatic fail** = an invariant broken in the *live harness run* (money doesn't add up, a lost event...), unless we found it and explained the cause before the panel did.
-
-**Problem 2 — what the harness does (from Definition of Done)**
-1. Replays **100,000 events**: 12% duplicates, shuffled within 48 h, 3% orphan returns, 20 simulated store outages, then compares **every store-day total to its checksum**.
-2. Runs ingest **while querying totals at 50 req/s** and checks no response shows a partly applied batch.
-3. Sends events **after day close** and checks they appear only as adjustments and the closed day's stored total is unchanged.
-4. Gift-card scenario: **40 cards, redeemed concurrently at 2-5 offline stores**; checks overspend per card is at or below the configured limit and every overspend is flagged.
-5. Drops/rebuilds read models and compares **SHA-256 over the totals table** (so our totals table must exist in a form the checker can read and hash; format TBD).
-
-**What the PDF does NOT tell us (read on day 1, first minutes of the round)**
-- Language/runtime of the harness and how it is run (CLI? docker image? against a base URL?)
-- Is our API contract fixed by the harness (endpoint paths, event JSON schema, auth) or do we define it and the harness adapts via config?
-- How it reads results: HTTP query endpoints vs. direct DB access vs. a totals export/table with a specific name and columns (matters for the SHA-256 check)
-- Event identity fields, the business-day rule it uses for its checksum, how it signals "store closed" / the simulated clock
-- How it triggers day close and rebuild (endpoints? CLI?). We expose `admin` endpoints.
-- Whether it simulates the gift-card lease protocol on the terminal side or only emits redeem events
-- No "mock external services" are described for P2 (those matter for payments/partners in other problems)
-
-**Our mitigation:** keep an **adapter layer** (in `Ledger.Api` + a mapping config) so a contract mismatch costs minutes, and build our own harness (`Ledger.Harness`) mirroring the 5 checks above so we're never blind. Open questions Q1-Q6 in Part B are exactly this list.
+- [x] Design doc (`docs/design.md`): components, data model, consistency model, failure modes, left out, and where the build changed course
+- [x] README (run, test, API, known limits, next steps), judge guide (`docs/judge-guide.md`: which test proves each DoD item), build log (this file)
+- [x] CI workflow (`.github/workflows/ci.yml`: build + all tests against a Postgres service, compose build)
+- [ ] Plug in the panel's real harness via adapter; fix format deltas (Q1–Q7) — **cannot be done until the harness is available**
+- [ ] Push to your personal GitHub — **needs your repo URL and a personal author email** (commits are currently authored with the work email)
+- [ ] Build `Name_P2.zip` → hr.india@aptos.com — **a submission to a third party: not done, needs your go-ahead and your name for the file**
+- **Gate:** fresh clone → `docker compose up` → tests green *(compose half unverified, see Stage 10)*
 
 ---
 
@@ -455,6 +428,8 @@ The PDF mentions the harness only in a few places; there is **no harness on this
 | 2026-11-03 | Stage 6 | PASSED (31 core + 10 harness + 42 integration) | Leases (secured+unsecured), reservation = expiry+48h, overspend flags; 40-card concurrent scenario within limit |
 | 2026-11-03 | Stage 7 | PASSED (33 core + 10 harness + 47 integration) | PN-counter loyalty balances; negative policy; included in rebuild hash |
 | 2026-11-03 | Stage 8 | PASSED (34 core + 10 harness + 50 integration) | Verified snapshots; tail replay; 1M-event benchmark: full rebuild 6.8 s vs 1.0 s from snapshot |
+| 2026-11-03 | Stage 9 | PASSED (ChaosTests, 59 s) | 100k replay through 2 real processes, one killed midway; nothing lost |
+| 2026-11-03 | Stage 10-11 | Written, partly unverified | Dockerfile/compose/nginx/dashboard/docs/CI written; compose never run (no Docker engine); GitHub push, harness adapter, zip pending the user |
 
 ## PART G — Decisions awaiting your input
 

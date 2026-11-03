@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>POS Ledger</title>
+<style>
+  :root { --bg:#fafafa; --fg:#1b1b1f; --muted:#6b6b76; --line:#e2e2e8; --accent:#2457d6; --bad:#b42318; --ok:#067647; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16161a; --fg:#ececf1; --muted:#9a9aa6; --line:#2c2c34; --accent:#7aa2ff; --bad:#ff8a80; --ok:#5fd39a; } }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
+  h1 { font-size:18px; margin:0 0 4px; } h2 { font-size:15px; margin:24px 0 6px; }
+  .muted { color:var(--muted); } .bad { color:var(--bad); } .ok { color:var(--ok); }
+  table { border-collapse:collapse; width:100%; } th, td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--line); }
+  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  .scroll { max-height:340px; overflow:auto; border:1px solid var(--line); border-radius:6px; }
+  input { background:transparent; color:inherit; border:1px solid var(--line); border-radius:6px; padding:4px 8px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:5px 12px; cursor:pointer; }
+</style>
+</head>
+<body>
+<h1>POS Ledger</h1>
+<div class="muted">Live read models. Money is shown in minor units (cents). <span id="status"></span></div>
+
+<h2>Store-day totals <input id="store" placeholder="filter by store, e.g. S001" size="22"> <button id="go">Refresh</button></h2>
+<div class="scroll"><table><thead><tr>
+  <th>Store</th><th>Business day</th><th>State</th><th class="n">Sales</th><th class="n">Returns</th><th class="n">Voids</th>
+  <th class="n">Own net</th><th class="n">Adjustments in</th><th class="n">Corrections</th><th class="n">Corrected net</th>
+</tr></thead><tbody id="totals"></tbody></table></div>
+
+<h2>Returns and voids waiting for their sale <span id="parkedCount" class="muted"></span></h2>
+<div class="scroll"><table><thead><tr><th>Event</th><th>Type</th><th>Store</th><th>Sale</th><th class="n">Amount</th><th>Waiting since</th></tr></thead><tbody id="parked"></tbody></table></div>
+
+<h2>Gift card flags <span id="flagCount" class="muted"></span></h2>
+<div class="scroll"><table><thead><tr><th>Card</th><th>Event</th><th>Flag</th><th class="n">Amount</th></tr></thead><tbody id="flags"></tbody></table></div>
+
+<h2>Loyalty accounts in debt <span id="negCount" class="muted"></span></h2>
+<div class="scroll"><table><thead><tr><th>Account</th><th class="n">Earned</th><th class="n">Burned</th><th class="n">Balance</th></tr></thead><tbody id="neg"></tbody></table></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const rows = (el, items, cols, empty) => {
+  el.innerHTML = items.length ? items.map(i => '<tr>' + cols.map(c => c(i)).join('') + '</tr>').join('') : '<tr><td colspan="10" class="muted">' + empty + '</td></tr>';
+};
+const t = f => i => '<td>' + esc(f(i)) + '</td>';
+const n = f => i => '<td class="n">' + esc(f(i)) + '</td>';
+async function get(url) { const r = await fetch(url); if (!r.ok) throw new Error(url + ' ' + r.status); return r.json(); }
+
+async function refresh() {
+  try {
+    const store = $('store').value.trim();
+    const [totals, parked, flags, neg] = await Promise.all([
+      get('/totals' + (store ? '?storeId=' + encodeURIComponent(store) : '')), get('/parked'), get('/giftcards/flags'), get('/loyalty/negative')]);
+    rows($('totals'), totals.slice(0, 500), [t(r => r.storeId), t(r => r.businessDate), t(r => r.closed ? 'closed' : 'open'),
+      n(r => r.salesMinor), n(r => r.returnsMinor), n(r => r.voidsMinor), n(r => r.netMinor), n(r => r.adjustmentsInMinor),
+      n(r => r.correctionsMinor), n(r => r.correctedNetMinor)], 'No totals yet.');
+    rows($('parked'), parked, [t(r => r.eventId), t(r => r.type), t(r => r.storeId), t(r => r.saleId), n(r => r.amountMinor), t(r => r.parkedAt)], 'Nothing waiting.');
+    rows($('flags'), flags, [t(r => r.cardId), t(r => r.eventId), t(r => r.kind), n(r => r.amountMinor)], 'No gift card rule has been broken.');
+    rows($('neg'), neg, [t(r => r.accountId), n(r => r.earnedPoints), n(r => r.burnedPoints), n(r => r.balancePoints)], 'No account is in debt.');
+    $('parkedCount').textContent = '(' + parked.length + ')'; $('flagCount').textContent = '(' + flags.length + ')'; $('negCount').textContent = '(' + neg.length + ')';
+    $('status').innerHTML = '<span class="ok">updated ' + new Date().toLocaleTimeString() + '</span>';
+  } catch (e) { $('status').innerHTML = '<span class="bad">' + esc(e.message) + '</span>'; }
+}
+$('go').onclick = refresh; $('store').onkeydown = e => { if (e.key === 'Enter') refresh(); };
+refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>

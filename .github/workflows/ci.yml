@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      LEDGER_TEST_PG: Host=localhost;Port=5432;Username=postgres;Password=postgres;Database=postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet build PosLedger.slnx -c Release
+      - run: dotnet test tests/Ledger.Core.Tests -c Release --no-build
+      - run: dotnet test tests/Ledger.Harness.Tests -c Release --no-build
+      - run: dotnet test tests/Ledger.Integration.Tests -c Release --no-build
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose build

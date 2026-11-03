@@ -24,6 +24,9 @@ builder.Services.AddHostedService<Ledger.Api.DayCloseScheduler>();
 
 var app = builder.Build();
 
+app.UseDefaultFiles();
+app.UseStaticFiles(); // the small ops dashboard in wwwroot/
+
 // Fail fast: a replica that cannot reach or migrate the database must not serve traffic.
 await Migrator.MigrateAsync(app.Services.GetRequiredService<NpgsqlDataSource>());
 
